@@ -1,0 +1,8 @@
+# Shared dependencies required by the Stage 03 feasibility experiments.
+fastapi>=0.120,<1
+httpx>=0.28,<1
+pydantic>=2.10,<3
+pypdf>=6,<7
+reportlab>=4,<5
+uvicorn>=0.35,<1
+

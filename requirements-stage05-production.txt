@@ -1,0 +1,4 @@
+# Production persistence adapter dependency for the Stage 05 PostgreSQL boundary.
+psycopg[binary]>=3.3,<4
+# Private local MinIO / S3-compatible object storage adapter.
+minio>=7.2,<8

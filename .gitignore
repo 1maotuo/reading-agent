@@ -1,0 +1,55 @@
+.project-to-act/
+
+# Local/private runtime data and internal handoff material.
+docs/evidence/
+docs/NEXT_TASK_HANDOFF.md
+NEW_TASK_PROMPT.txt
+work/
+var/
+artifacts/
+
+# Reproducible experiment output; keep source, tests and small synthetic fixtures.
+experiments/**/artifacts/
+experiments/**/runs/
+# Sample corpora and experiment harnesses are kept local; do not publish book-like input files.
+experiments/f03_01_document_parsing/fixtures/
+experiments/f03_01_document_parsing/run_experiment.py
+experiments/f03_01_document_parsing/scripts/
+experiments/f03_01_document_parsing/tests/
+experiments/f03_02_hybrid_retrieval/
+experiments/f03_03_runtime_sse/
+experiments/f03_04_highlight_anchor/
+evals/
+
+# Python, pytest and local virtual environments.
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest-tmp-*/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# JavaScript package/build output.
+.pnpm-store/
+node_modules/
+web/node_modules/
+web/dist/
+*.tsbuildinfo
+web/vite.config.js
+web/vite.config.mjs
+web/vite.config.cjs
+web/vite.config.d.ts
+web/vite.config.*.timestamp-*
+
+# Never commit local credentials.
+.env
+.env.*
+!.env.example
+
+# Docker Desktop repair helpers are machine-specific and not part of the public source.
+tools/repair_docker_secrets_socket.ps1
+tools/repair_docker_after_reboot.ps1
+tools/move_docker_secrets_native.ps1
