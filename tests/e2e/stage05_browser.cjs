@@ -6,7 +6,7 @@ if (!packageRoot) throw new Error("CODEX_NODE_MODULES is required");
 const { chromium } = require(path.join(packageRoot, "playwright"));
 
 const root = path.resolve(__dirname, "..", "..");
-const artifacts = path.join(root, "artifacts", "stage05");
+const artifacts = process.env.READING_AGENT_ARTIFACT_DIR || path.join(root, "artifacts", "stage05");
 const fixture = path.join(root, "experiments", "f03_01_document_parsing", "fixtures", "thinking_clearly.md");
 fs.mkdirSync(artifacts, { recursive: true });
 
@@ -33,6 +33,19 @@ async function run() {
   const uploadedText = await page.locator(".reader-block").first().innerText();
   if (!uploadedText.toLowerCase().includes("thinking")) throw new Error("uploaded source text was not rendered");
 
+  const questionBox = page.locator(".question-box textarea");
+  await questionBox.fill("这一章的核心论点是什么？");
+  await page.locator('.question-box button[aria-label="发送"]').click();
+  if ((await questionBox.inputValue()) !== "") throw new Error("question input did not clear immediately");
+  await page.locator(".exchange.pending .user-message").waitFor();
+  await page.locator(".exchange").first().locator(".citations button").first().waitFor({ timeout: 70_000 });
+  const directAnswer = await page.locator(".assistant-message").last().innerText();
+  if (!directAnswer.trim()) throw new Error("direct dialogue answer was empty");
+
+  await questionBox.fill("作者是怎么论证的？");
+  await page.locator('.question-box button[aria-label="发送"]').click();
+  await page.locator(".exchange").nth(1).locator(".citations button").first().waitFor({ timeout: 70_000 });
+
   await page.locator(".reader-block").first().evaluate((element) => {
     const text = element.firstChild;
     if (!text) throw new Error("reader block has no text node");
@@ -44,14 +57,23 @@ async function run() {
     selection.addRange(range);
     element.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
   });
-  await page.locator(".selection-menu").waitFor();
-  await page.locator(".selection-menu").getByRole("button", { name: "解释" }).click();
-  await page.locator(".citations button").first().waitFor({ timeout: 70_000 });
+  await page.locator(".context-chip").waitFor();
+  await questionBox.fill("这段话在这一章里起什么作用？");
+  await page.locator('.question-box button[aria-label="发送"]').click();
+  await page.locator(".exchange").nth(2).locator(".citations button").first().waitFor({ timeout: 70_000 });
+  await page.locator(".context-chip").waitFor({ state: "detached" });
+  await page.getByRole("button", { name: "收起一起读" }).click();
+  await page.locator(".ai-panel").waitFor({ state: "hidden" });
+  await page.getByRole("button", { name: "打开一起读" }).click();
+  await page.locator(".ai-panel").waitFor({ state: "visible" });
+  await page.getByRole("button", { name: "阅读设置" }).click();
+  await page.getByRole("heading", { name: "设置" }).waitFor();
+  await page.locator('.settings-drawer button[aria-label="关闭设置"]').click();
   await page.screenshot({ path: path.join(artifacts, "stage05-desktop.png"), fullPage: true });
 
   const answerVisible = await page.locator(".assistant-message").last().innerText();
   if (!answerVisible.trim()) throw new Error("answer was empty");
-  await page.locator(".citations button").first().click();
+  await page.locator(".exchange").nth(2).locator(".citations button").first().click();
   await page.waitForTimeout(500);
 
   const lastBlock = page.locator(".reader-block").last();
@@ -74,7 +96,12 @@ async function run() {
       login: true,
       real_file_upload: true,
       reader_text: true,
-      same_block_highlight: true,
+      direct_dialogue: true,
+      repeated_dialogue: true,
+      optional_context_chip: true,
+      immediate_submit_feedback: true,
+      collapsible_ai_panel: true,
+      settings_drawer: true,
       evidence_answer: true,
       citation_jump: true,
       reload_session_and_book: true,

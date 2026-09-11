@@ -233,6 +233,26 @@ def test_postgres_job_store_claim_and_compare_and_swap(database: PostgresDatabas
         store.compare_and_swap(claimed, advanced)
     assert conflict.value.code is ErrorCode.VERSION_CONFLICT
     assert store.get(job.job_id).user_id == scope.user_id  # type: ignore[union-attr]
+    queued_next = JobRecord.model_validate(
+        template.model_copy(
+            update={
+                "job_id": uuid4(),
+                "status": JobStatus.QUEUED,
+                "stage": JobStage.VALIDATE,
+                "attempts": 0,
+                "lease_owner": None,
+                "lease_expires_at": None,
+                "heartbeat_at": None,
+                "idempotency_key": f"stage05-job-store-next-{uuid4()}",
+                "checkpoint": {},
+                "row_version": 1,
+            }
+        ).model_dump()
+    )
+    store.create(queued_next)
+    claimed_next = store.claim_next("worker-next", lease_seconds=60)
+    assert claimed_next is not None
+    assert claimed_next.status is JobStatus.RUNNING and 1 <= claimed_next.attempts <= 3
 
 
 def test_postgres_answer_store_history_and_event_replay(database: PostgresDatabase) -> None:

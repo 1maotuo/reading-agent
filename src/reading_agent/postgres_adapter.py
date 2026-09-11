@@ -1,10 +1,9 @@
 """Small PostgreSQL adapter for the Stage 05 production-persistence boundary.
 
 The adapter implements only the already frozen book/read/progress/publish ports,
-the PostgreSQL evidence readback boundary, and a database-backed JobStore
-boundary. Authentication, object storage, answer history, and multi-device
-conflict policy remain outside this work package and therefore fail closed
-rather than silently using the SQLite preview.
+the PostgreSQL evidence readback boundary, database-backed JobStore and answer
+replay boundary. Authentication and object storage are separate adapters; the
+runtime selects them explicitly rather than silently falling back.
 """
 
 from __future__ import annotations
@@ -16,7 +15,7 @@ import json
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 from uuid import UUID
 
 import psycopg
@@ -180,6 +179,14 @@ class PostgresJobStore(JobStorePort):
             ).fetchone()
         return None if row is None else _job_model(row)
 
+    def list_for_book(self, user_id: UUID, book_id: UUID) -> list[JobRecord]:
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                f"SELECT {_JOB_COLUMNS} FROM jobs WHERE user_id = %s AND book_id = %s ORDER BY created_at",
+                (user_id, book_id),
+            ).fetchall()
+        return [_job_model(row) for row in rows]
+
     def create(self, job: JobRecord) -> JobRecord:
         with self.database.transaction() as connection:
             try:
@@ -261,6 +268,36 @@ class PostgresJobStore(JobStorePort):
             raise ContractViolation(ErrorCode.CONFLICT, "job is not claimable")
         return _job_model(row)
 
+    def claim_next(self, worker_id: str, *, lease_seconds: int = 30) -> JobRecord | None:
+        """Claim one queued/expired job with PostgreSQL row locking."""
+
+        if not worker_id or lease_seconds <= 0:
+            raise ContractViolation(ErrorCode.INVALID_INPUT, "invalid worker lease")
+        with self.database.transaction() as connection:
+            row = connection.execute(
+                f"""
+                UPDATE jobs
+                SET status = 'running', attempts = attempts + 1,
+                    lease_owner = %s,
+                    lease_expires_at = CURRENT_TIMESTAMP + (%s * INTERVAL '1 second'),
+                    heartbeat_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP,
+                    row_version = row_version + 1
+                WHERE job_id = (
+                    SELECT job_id FROM jobs
+                    WHERE attempts < 3
+                      AND ((status IN ('queued', 'retry_wait') AND lease_owner IS NULL)
+                           OR (status = 'running' AND lease_expires_at <= CURRENT_TIMESTAMP))
+                    ORDER BY created_at, job_id
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                )
+                RETURNING {_JOB_COLUMNS}
+                """,
+                (worker_id, lease_seconds),
+            ).fetchone()
+        return None if row is None else _job_model(row)
+
 
 class PostgresBookRepository(BookRepositoryPort):
     """Owner- and version-scoped repository using parameterized SQL."""
@@ -270,6 +307,124 @@ class PostgresBookRepository(BookRepositoryPort):
             raise PostgresAdapterError("cursor secret is too short")
         self.database = database
         self.cursor_secret = cursor_secret
+
+    def create_book(self, book: Book) -> Book:
+        now = book.created_at
+        with self.database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO users(user_id, created_at) VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING",
+                (book.user_id, now),
+            )
+            row = connection.execute(
+                """
+                INSERT INTO books(book_id, user_id, title, format, active_version_id,
+                                  status, created_at, row_version)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING book_id, user_id, title, format, active_version_id,
+                          status, created_at, row_version
+                """,
+                (
+                    book.book_id, book.user_id, book.title, book.format.value,
+                    book.active_version_id, book.status, book.created_at, book.row_version,
+                ),
+            ).fetchone()
+        row["format"] = BookFormat(row["format"])
+        return Book.model_validate(row)
+
+    def persist_book_content(
+        self,
+        *,
+        version: Any,
+        chapters: Iterable[Chapter],
+        blocks: Iterable[Block],
+        chunks: Iterable[Chunk],
+        chunk_texts: dict[UUID, str],
+        progress: Iterable[ReadingProgress],
+    ) -> None:
+        """Write one parsed version and all dependent rows in one transaction."""
+
+        chapters = list(chapters)
+        blocks = list(blocks)
+        chunks = list(chunks)
+        progress = list(progress)
+        if not chapters or not blocks or not chunks:
+            raise ContractViolation(ErrorCode.INVALID_INPUT, "book content bundle is empty")
+        with self.database.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO book_versions
+                    (book_version_id, user_id, book_id, file_sha256, pipeline_version, status, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    version.book_version_id, version.user_id, version.book_id,
+                    version.file_sha256, version.pipeline_version, version.status.value,
+                    version.created_at,
+                ),
+            )
+            for chapter in chapters:
+                connection.execute(
+                    """
+                    INSERT INTO chapters
+                        (chapter_id, user_id, book_id, book_version_id, ordinal, title, source_locator)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+                    """,
+                    (
+                        chapter.chapter_id, chapter.user_id, chapter.book_id,
+                        chapter.book_version_id, chapter.ordinal, chapter.title,
+                        json.dumps(chapter.source_locator.model_dump(mode="json")),
+                    ),
+                )
+            for block in blocks:
+                connection.execute(
+                    """
+                    INSERT INTO blocks
+                        (block_id, user_id, book_id, book_version_id, chapter_id, ordinal,
+                         body, text_sha256, source_locator)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                    """,
+                    (
+                        block.block_id, block.user_id, block.book_id, block.book_version_id,
+                        block.chapter_id, block.ordinal, block.text, block.text_sha256,
+                        json.dumps(block.source_locator.model_dump(mode="json")),
+                    ),
+                )
+            block_ids = {block.block_id for block in blocks}
+            for chunk in chunks:
+                if any(block_id not in block_ids for block_id in chunk.block_ids):
+                    raise ContractViolation(ErrorCode.INVALID_INPUT, "chunk references a block outside the import bundle")
+                text = chunk_texts.get(chunk.chunk_id)
+                if not text:
+                    raise ContractViolation(ErrorCode.INVALID_INPUT, "chunk text is missing")
+                connection.execute(
+                    """
+                    INSERT INTO chunks
+                        (chunk_id, user_id, book_id, book_version_id, chapter_id, chunk_index,
+                         block_ids, text_sha256, token_count, embedding_model, chunker_version, search_text)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        chunk.chunk_id, chunk.user_id, chunk.book_id, chunk.book_version_id,
+                        chunk.chapter_id, chunk.chunk_index,
+                        json.dumps([str(value) for value in chunk.block_ids]), chunk.text_sha256,
+                        chunk.token_count, chunk.embedding_model, chunk.chunker_version, text,
+                    ),
+                )
+            for item in progress:
+                connection.execute(
+                    """
+                    INSERT INTO reading_progress
+                        (user_id, book_id, book_version_id, chapter_id, last_chunk_index,
+                         furthest_chunk_index, position, updated_at, device_id, row_version)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s)
+                    """,
+                    (
+                        item.user_id, item.book_id, item.book_version_id, item.chapter_id,
+                        item.last_chunk_index, item.furthest_chunk_index,
+                        json.dumps(item.position.model_dump(mode="json")), item.updated_at,
+                        item.position.device_id, item.row_version,
+                    ),
+                )
 
     def get_book(self, scope: ScopeContext) -> Book | None:
         with self.database.connection() as connection:

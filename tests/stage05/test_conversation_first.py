@@ -188,12 +188,17 @@ def test_conversation_first_direct_question_routes_and_reuses_scope(tmp_path: Pa
             headers={"Idempotency-Key": str(uuid4()), "X-CSRF-Token": csrf},
         )
         assert open_followup.status_code == 202, open_followup.text
-        assert open_followup.json()["intent"] == {
-            "route": "open_dialogue",
-            "relation": "followup",
-            "goals": [],
-            "context_sources": ["current_view", "previous_turn"],
-        }
+        followup_intent = open_followup.json()["intent"]
+        assert followup_intent["route"] == "open_dialogue"
+        assert followup_intent["scope"] == "open"
+        assert followup_intent["relation"] == "followup"
+        assert followup_intent["tasks"] == ["discuss"]
+        assert followup_intent["targets"] == [
+            {"kind": "previous_turn", "identifier": None, "explicit": False}
+        ]
+        assert followup_intent["context_sources"] == ["current_view", "previous_turn"]
+        assert followup_intent["requires_evidence"] is False
+        assert followup_intent["resolved_by"] == "degraded_fallback"
         assert len(model.histories[-1]) == 1
         assert all("不应进入" not in item["question"] and "不应进入" not in item["answer"] for item in model.histories[-1])
 

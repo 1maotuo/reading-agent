@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 import { ApiError, api, apiAll, requestId } from "./api";
-import { ArrowIcon, BookIcon, CheckIcon, CloseIcon, MenuIcon, QuoteIcon, SendIcon, SparkIcon, UploadIcon } from "./icons";
-import type { Answer, Block, Book, Chapter, Evidence, Highlight, Progress, Session } from "./types";
+import { ArrowIcon, BookIcon, CloseIcon, MenuIcon, PanelIcon, QuoteIcon, SendIcon, SettingsIcon, SparkIcon, StopIcon, UploadIcon } from "./icons";
+import type { Answer, Block, Book, BookType, Chapter, Companion, Evidence, Highlight, Progress, ReadingMemory, Session } from "./types";
 
 type ViewState = "library" | "reader";
 type SelectionDraft = {
@@ -9,9 +10,43 @@ type SelectionDraft = {
   start: number;
   end: number;
   quote: string;
-  x: number;
-  y: number;
 };
+
+type ReaderPreferences = {
+  theme: "paper" | "night";
+  brightness: number;
+  fontSize: number;
+  lineHeight: number;
+  contentWidth: number;
+};
+
+const DEFAULT_READER_PREFERENCES: ReaderPreferences = {
+  theme: "paper",
+  brightness: 100,
+  fontSize: 20,
+  lineHeight: 2,
+  contentWidth: 740
+};
+
+function storedNumber(key: string, fallback: number): number {
+  const raw = window.localStorage.getItem(key);
+  if (raw === null) return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+type SpeechResultEvent = { resultIndex: number; results: { [index: number]: { 0: { transcript: string }; isFinal: boolean }; length: number } };
+type SpeechRecognitionLike = {
+  lang: string;
+  continuous: boolean;
+  interimResults: boolean;
+  onresult: ((event: SpeechResultEvent) => void) | null;
+  onerror: (() => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+};
+type SpeechWindow = Window & typeof globalThis & { webkitSpeechRecognition?: new () => SpeechRecognitionLike };
 
 const FORMAT_LABEL: Record<Book["format"], string> = {
   pdf: "PDF",
@@ -215,21 +250,57 @@ function ReaderView({ book, onBack }: { book: Book; onBack: () => void }) {
   const [answers, setAnswers] = useState<Answer[]>([]);
   const [question, setQuestion] = useState("");
   const [conversationId, setConversationId] = useState<string | null>(null);
-  const [contextHighlight, setContextHighlight] = useState<Highlight | null>(null);
   const [asking, setAsking] = useState(false);
   const [liveAnswer, setLiveAnswer] = useState("");
+  const [pendingQuestion, setPendingQuestion] = useState("");
+  const [answerPhase, setAnswerPhase] = useState("正在理解你的问题");
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [selection, setSelection] = useState<SelectionDraft | null>(null);
   const [notice, setNotice] = useState("");
   const [mobilePane, setMobilePane] = useState<"toc" | "text" | "ai">("text");
+  const [companion, setCompanion] = useState<Companion | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [bookTypeChoice, setBookTypeChoice] = useState<BookType | "auto">("auto");
+  const [savingSkill, setSavingSkill] = useState(false);
+  const [listening, setListening] = useState(false);
+  const [memories, setMemories] = useState<ReadingMemory[]>([]);
+  const [tocOpen, setTocOpen] = useState(() => window.localStorage.getItem("reader.tocOpen") !== "false");
+  const [aiOpen, setAiOpen] = useState(() => window.localStorage.getItem("reader.aiOpen") !== "false");
+  const [aiWidth, setAiWidth] = useState(() => Math.max(320, Math.min(620, storedNumber("reader.aiWidth", 390))));
+  const [readerPreferences, setReaderPreferences] = useState<ReaderPreferences>(() => ({
+    theme: window.localStorage.getItem("reader.theme") === "night" ? "night" : "paper",
+    brightness: Math.max(70, Math.min(115, storedNumber("reader.brightness", 100))),
+    fontSize: Math.max(16, Math.min(28, storedNumber("reader.fontSize", 20))),
+    lineHeight: Math.max(1.6, Math.min(2.4, storedNumber("reader.lineHeight", 2))),
+    contentWidth: Math.max(560, Math.min(920, storedNumber("reader.contentWidth", 740)))
+  }));
   const blockElements = useRef(new Map<string, HTMLElement>());
+  const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const pendingEvidenceBlock = useRef<string | null>(null);
   const saveTimer = useRef<number | undefined>(undefined);
+  const eventSourceRef = useRef<EventSource | null>(null);
 
   useEffect(() => { progressRef.current = progress; }, [progress]);
 
+  useEffect(() => {
+    window.localStorage.setItem("reader.tocOpen", String(tocOpen));
+    window.localStorage.setItem("reader.aiOpen", String(aiOpen));
+    window.localStorage.setItem("reader.aiWidth", String(aiWidth));
+  }, [tocOpen, aiOpen, aiWidth]);
+
+  useEffect(() => {
+    for (const [key, value] of Object.entries(readerPreferences)) {
+      window.localStorage.setItem(`reader.${key}`, String(value));
+    }
+  }, [readerPreferences]);
+
   const loadHistory = useCallback(async () => {
-    const result = await api<{ items: Answer[] }>(`/api/v1/books/${book.book_id}/answers`);
+    const [result, loadedMemories] = await Promise.all([
+      api<{ items: Answer[] }>(`/api/v1/books/${book.book_id}/answers`),
+      api<ReadingMemory[]>(`/api/v1/books/${book.book_id}/memories`)
+    ]);
     setAnswers(result.items);
+    setMemories(loadedMemories);
     const latest = [...result.items].reverse().find((item) => item.status === "completed" && item.conversation_id);
     setConversationId(latest?.conversation_id ?? null);
   }, [book.book_id]);
@@ -251,6 +322,87 @@ function ReaderView({ book, onBack }: { book: Book; onBack: () => void }) {
     }).catch((reason) => setNotice(errorMessage(reason)));
     return () => { active = false; };
   }, [book.book_id]);
+
+  useEffect(() => {
+    Promise.all([
+      api<Companion>(`/api/v1/books/${book.book_id}/companion`),
+      api<ReadingMemory[]>(`/api/v1/books/${book.book_id}/memories`)
+    ]).then(([value, loadedMemories]) => {
+      setCompanion(value);
+      setBookTypeChoice(value.is_overridden ? value.effective_book_type : "auto");
+      setMemories(loadedMemories);
+    }).catch((reason) => setNotice(errorMessage(reason)));
+  }, [book.book_id]);
+
+  useEffect(() => () => {
+    recognitionRef.current?.stop();
+    window.speechSynthesis?.cancel();
+    eventSourceRef.current?.close();
+  }, []);
+
+  async function saveCompanion(event: React.FormEvent) {
+    event.preventDefault();
+    if (!companion || savingSkill) return;
+    setSavingSkill(true);
+    try {
+      const value = await api<Companion>(`/api/v1/books/${book.book_id}/companion`, {
+        method: "PUT",
+        body: JSON.stringify({
+          ...companion.user_skill,
+          book_type: bookTypeChoice === "auto" ? null : bookTypeChoice
+        })
+      });
+      setCompanion(value);
+      setSettingsOpen(false);
+      setNotice("阅读方式已保存，下一轮回答会使用新设置");
+    } catch (reason) {
+      setNotice(errorMessage(reason));
+    } finally {
+      setSavingSkill(false);
+    }
+  }
+
+  function beginListening() {
+    const SpeechRecognition = (window as SpeechWindow).webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      setNotice("当前浏览器不支持语音转文字，请继续使用键盘输入");
+      return;
+    }
+    const recognition = new SpeechRecognition();
+    recognition.lang = "zh-CN";
+    recognition.continuous = true;
+    recognition.interimResults = false;
+    recognition.onresult = (event) => {
+      let transcript = "";
+      for (let index = event.resultIndex; index < event.results.length; index += 1) {
+        if (event.results[index].isFinal) transcript += event.results[index][0].transcript;
+      }
+      if (transcript.trim()) setQuestion((current) => `${current}${current.trim() ? " " : ""}${transcript.trim()}`);
+    };
+    recognition.onerror = () => setNotice("没有听清，请重试或改用键盘输入");
+    recognition.onend = () => setListening(false);
+    recognitionRef.current = recognition;
+    setListening(true);
+    try { recognition.start(); } catch { setListening(false); }
+  }
+
+  function endListening() {
+    recognitionRef.current?.stop();
+    recognitionRef.current = null;
+    setListening(false);
+  }
+
+  function speak(text: string) {
+    if (!("speechSynthesis" in window)) {
+      setNotice("当前浏览器不支持语音播放");
+      return;
+    }
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = "zh-CN";
+    utterance.rate = companion?.user_skill.voice_rate ?? 0.95;
+    window.speechSynthesis.speak(utterance);
+  }
 
   useEffect(() => {
     if (!chapterId) return;
@@ -336,82 +488,126 @@ function ReaderView({ book, onBack }: { book: Book; onBack: () => void }) {
     const end = offsetInside(startElement, range.endContainer, range.endOffset);
     const quote = block.text.slice(start, end);
     if (!quote.trim()) return;
-    const rect = range.getBoundingClientRect();
-    setSelection({ block, start, end, quote, x: Math.min(window.innerWidth - 240, Math.max(16, rect.left)), y: Math.max(70, rect.top - 54) });
+    setSelection({ block, start, end, quote });
+    setAiOpen(true);
+    setMobilePane("ai");
+    window.getSelection()?.removeAllRanges();
   }
 
-  async function ask(text: string, highlightId?: string) {
+  async function ask(text: string) {
     const clean = text.trim();
     if (!clean || asking) return;
-    const submittedHighlightId = highlightId ?? contextHighlight?.highlight_id ?? null;
+    const submittedSelection = selection;
+    const draftBeforeSubmit = text;
     setAsking(true);
     setLiveAnswer("");
+    setPendingQuestion(clean);
+    setQuestion("");
+    setAnswerPhase("正在理解你的问题");
     setNotice("");
+    setAiOpen(true);
     setMobilePane("ai");
     try {
+      const selectionContext = submittedSelection ? {
+        chapter_id: submittedSelection.block.chapter_id,
+        block_id: submittedSelection.block.block_id,
+        start_offset: submittedSelection.start,
+        end_offset: submittedSelection.end,
+        exact_quote: submittedSelection.quote,
+        text_sha256: await textHash(submittedSelection.quote)
+      } : null;
       const run = await api<{ run_id: string; conversation_id: string }>(`/api/v1/books/${book.book_id}/questions`, {
         method: "POST",
         headers: { "Idempotency-Key": requestId() },
         body: JSON.stringify({
           question: clean,
-          highlight_id: submittedHighlightId,
+          selection_context: selectionContext,
           current_chapter_id: chapterId || null,
           conversation_id: conversationId,
           client_request_id: requestId()
         })
       });
+      setActiveRunId(run.run_id);
+      if (submittedSelection === selection) setSelection(null);
       await new Promise<void>((resolve, reject) => {
         const source = new EventSource(`/api/v1/answer-runs/${run.run_id}/events`, { withCredentials: true });
+        eventSourceRef.current = source;
+        source.addEventListener("status", (event) => {
+          const payload = JSON.parse((event as MessageEvent).data).payload;
+          setAnswerPhase(payload.label);
+        });
+        source.addEventListener("tool_started", () => setAnswerPhase("正在查找相关原文"));
+        source.addEventListener("evidence", () => setAnswerPhase("正在依据原文组织回答"));
         source.addEventListener("answer_delta", (event) => {
           const payload = JSON.parse((event as MessageEvent).data).payload;
           setLiveAnswer((current) => current + payload.text_delta);
         });
         source.addEventListener("completed", async () => {
           source.close();
+          eventSourceRef.current = null;
           setConversationId(run.conversation_id);
-          setQuestion((current) => current.trim() === clean ? "" : current);
-          setContextHighlight((current) => current?.highlight_id === submittedHighlightId ? null : current);
           try { await loadHistory(); } finally { resolve(); }
+        });
+        source.addEventListener("cancelled", () => {
+          source.close();
+          eventSourceRef.current = null;
+          resolve();
         });
         source.addEventListener("failed", (event) => {
           const payload = JSON.parse((event as MessageEvent).data).payload;
           source.close();
+          eventSourceRef.current = null;
           reject(new ApiError(payload.error?.message ?? "回答失败", payload.error?.code));
         });
         source.onerror = () => {
           source.close();
+          eventSourceRef.current = null;
           reject(new ApiError("回答连接中断，请重试", "stream_interrupted"));
         };
       });
     } catch (reason) {
       setNotice(errorMessage(reason));
+      setQuestion((current) => current.trim() ? current : draftBeforeSubmit);
+      if (submittedSelection) setSelection((current) => current ?? submittedSelection);
     } finally {
       setAsking(false);
       setLiveAnswer("");
+      setPendingQuestion("");
+      setActiveRunId(null);
     }
   }
 
-  async function useSelection() {
-    if (!selection) return;
+  async function stopAnswer() {
+    if (!activeRunId) return;
     try {
-      const quoteHash = await textHash(selection.quote);
-      const anchor = await api<Highlight>(`/api/v1/books/${book.book_id}/highlights`, {
-        method: "POST",
-        headers: { "Idempotency-Key": requestId() },
-        body: JSON.stringify({
-          chapter_id: selection.block.chapter_id,
-          start: { block_id: selection.block.block_id, offset: selection.start },
-          end: { block_id: selection.block.block_id, offset: selection.end },
-          exact_quote: selection.quote,
-          prefix: selection.block.text.slice(Math.max(0, selection.start - 48), selection.start),
-          suffix: selection.block.text.slice(selection.end, selection.end + 48),
-          text_sha256: quoteHash
-        })
-      });
-      setHighlights((current) => [...current, anchor]);
-      setContextHighlight(anchor);
-      setSelection(null);
-      window.getSelection()?.removeAllRanges();
+      setAnswerPhase("正在停止生成");
+      await api(`/api/v1/answer-runs/${activeRunId}/cancel`, { method: "POST" });
+    } catch (reason) {
+      setNotice(errorMessage(reason));
+    }
+  }
+
+  function beginPanelResize(event: React.PointerEvent<HTMLDivElement>) {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = aiWidth;
+    const move = (moveEvent: PointerEvent) => {
+      setAiWidth(Math.max(320, Math.min(620, startWidth + startX - moveEvent.clientX)));
+    };
+    const finish = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", finish);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", finish);
+  }
+
+  async function clearMemories() {
+    if (!window.confirm("清除这本书的全部长期记忆？原文、划线和对话不会删除。")) return;
+    try {
+      await api(`/api/v1/books/${book.book_id}/memories`, { method: "DELETE" });
+      setMemories([]);
+      setNotice("这本书的长期记忆已清除");
     } catch (reason) {
       setNotice(errorMessage(reason));
     }
@@ -431,24 +627,37 @@ function ReaderView({ book, onBack }: { book: Book; onBack: () => void }) {
   const highlightedBlocks = useMemo(() => new Set(highlights.flatMap((item) => [item.start.block_id, item.end.block_id])), [highlights]);
   const currentOrdinal = progress?.position.block_id ? blocks.findIndex((item) => item.block_id === progress.position.block_id) : 0;
   const percent = blocks.length ? Math.max(1, Math.round(((currentOrdinal + 1) / blocks.length) * 100)) : 0;
+  const paperBase = readerPreferences.theme === "night" ? [31, 32, 29] : [251, 250, 246];
+  const brightnessFactor = readerPreferences.brightness / 100;
+  const readerPaper = `rgb(${paperBase.map((channel) => Math.max(0, Math.min(255, Math.round(channel * brightnessFactor)))).join(",")})`;
+  const readerStyle = {
+    "--toc-width": tocOpen ? "244px" : "0px",
+    "--ai-width": aiOpen ? `${aiWidth}px` : "0px",
+    "--reader-font-size": `${readerPreferences.fontSize}px`,
+    "--reader-line-height": String(readerPreferences.lineHeight),
+    "--reader-content-width": `${readerPreferences.contentWidth}px`,
+    "--reader-paper": readerPaper
+  } as CSSProperties;
 
   return (
-    <div className={`reader-shell pane-${mobilePane}`}>
+    <div className={`reader-shell pane-${mobilePane} theme-${readerPreferences.theme} ${tocOpen ? "" : "toc-closed"} ${aiOpen ? "" : "ai-closed"}`} style={readerStyle}>
       <header className="reader-topbar">
+        <button className="panel-toggle desktop-only" onClick={() => setTocOpen((value) => !value)} aria-label={tocOpen ? "收起目录" : "打开目录"}><PanelIcon /></button>
         <button className="icon-button back-button" onClick={onBack} aria-label="返回书架"><ArrowIcon /></button>
         <button className="mobile-menu" onClick={() => setMobilePane("toc")}><MenuIcon /></button>
         <div className="reader-title"><strong>{book.title}</strong><span>{currentChapter?.title ?? "正在载入"}</span></div>
         <div className="reading-progress"><span style={{ width: `${percent}%` }} /><small>{percent}%</small></div>
+        <button className="panel-toggle desktop-only" onClick={() => setAiOpen((value) => !value)} aria-label={aiOpen ? "收起一起读" : "打开一起读"}><SparkIcon /></button>
         <button className="ai-mobile-button" onClick={() => setMobilePane("ai")}><SparkIcon />一起读</button>
       </header>
-      <aside className="toc-panel">
+      <aside className={`toc-panel ${tocOpen ? "" : "collapsed"}`}>
         <div className="panel-head"><Logo /><button className="mobile-close" onClick={() => setMobilePane("text")}><CloseIcon /></button></div>
         <button className="back-to-library" onClick={onBack}><ArrowIcon />返回书架</button>
         <p className="panel-label">目录</p>
         <nav className="chapter-list">
           {chapters.map((chapter) => <button key={chapter.chapter_id} className={chapter.chapter_id === chapterId ? "active" : ""} onClick={() => { setChapterId(chapter.chapter_id); setMobilePane("text"); }}><span>{String(chapter.ordinal + 1).padStart(2, "0")}</span>{chapter.title}</button>)}
         </nav>
-        <div className="toc-footer"><span><CheckIcon />进度已保存</span><small>本地开发预览</small></div>
+        <div className="toc-footer"><button onClick={() => setSettingsOpen(true)}><SettingsIcon />阅读设置</button></div>
       </aside>
       <main className="reading-scroll" onMouseUp={captureSelection}>
         <article className="reading-page">
@@ -465,22 +674,50 @@ function ReaderView({ book, onBack }: { book: Book; onBack: () => void }) {
           {!blocks.length && <div className="loading-copy">正在整理这一章…</div>}
         </article>
       </main>
-      <aside className="ai-panel">
-        <div className="ai-heading"><div><SparkIcon /><span><strong>一起读</strong><small>回答只基于你的书</small></span></div><button className="mobile-close" onClick={() => setMobilePane("text")}><CloseIcon /></button></div>
+      <aside className={`ai-panel ${aiOpen ? "" : "collapsed"}`}>
+        <div className="panel-resizer" onPointerDown={beginPanelResize} aria-label="拖动调整一起读宽度" />
+        <div className="ai-heading"><div><SparkIcon /><span><strong>一起读</strong><small>{companion?.book_type_label ?? "正在识别阅读方式"}</small></span></div><button className="mobile-close" onClick={() => setMobilePane("text")}><CloseIcon /></button></div>
         <div className="conversation">
           {!answers.length && !liveAnswer && <div className="ai-welcome"><span><QuoteIcon /></span><h2>直接和我聊聊</h2><p>不用先划线。你可以直接提问、追问，或把正文片段加入下一轮上下文。</p><div className="suggestions"><button onClick={() => setQuestion("这一章的核心论点是什么？")}>这一章的核心论点是什么？</button><button onClick={() => setQuestion("作者是怎么论证的？")}>作者是怎么论证的？</button></div></div>}
-          {answers.map((answer) => <div className="exchange" key={answer.run_id}><div className="user-message">{answer.question}</div><div className="assistant-message"><div className="assistant-label"><SparkIcon />页伴</div><AnswerText text={answer.answer} />{answer.evidence.length > 0 && <div className="citations">{answer.evidence.map((item, index) => <button key={item.evidence_id} onClick={() => jumpToEvidence(item)}><QuoteIcon />原文 {index + 1} · {item.source_locator.kind === "page" ? `第 ${item.source_locator.value} 页` : "返回段落"}</button>)}</div>}</div></div>)}
+          {answers.map((answer) => <div className="exchange" key={answer.run_id}><div className="user-message">{answer.question}</div><div className="assistant-message"><div className="assistant-label"><SparkIcon />页伴<button className="speak-button" onClick={() => speak(answer.answer)}>播放</button></div><AnswerText text={answer.answer} />{answer.evidence.length > 0 && <div className="citations">{answer.evidence.map((item, index) => <button key={item.evidence_id} onClick={() => jumpToEvidence(item)}><QuoteIcon />原文 {index + 1} · {item.source_locator.kind === "page" ? `第 ${item.source_locator.value} 页` : "返回段落"}</button>)}</div>}</div></div>)}
+          {pendingQuestion && <div className="exchange pending"><div className="user-message">{pendingQuestion}</div></div>}
           {liveAnswer && <div className="assistant-message live"><div className="assistant-label"><SparkIcon />页伴正在回答</div><AnswerText text={liveAnswer} /><i className="typing-caret" /></div>}
-          {asking && !liveAnswer && <div className="thinking-row"><span /><span /><span />正在理解你的问题</div>}
+          {asking && <div className="thinking-row"><span /><span /><span />{answerPhase}<button type="button" onClick={stopAnswer}><StopIcon />停止</button></div>}
         </div>
         {notice && <div className="ai-notice"><span>{notice}</span><button onClick={() => setNotice("")}><CloseIcon /></button></div>}
         <form className="question-box" onSubmit={(event) => { event.preventDefault(); ask(question); }}>
-          {contextHighlight && <div className="context-chip"><QuoteIcon /><span>引用：{contextHighlight.exact_quote}</span><button type="button" onClick={() => setContextHighlight(null)} aria-label="移除引用"><CloseIcon /></button></div>}
+          {selection && <div className="context-chip"><QuoteIcon /><span>本轮原文：{selection.quote}</span><button type="button" className="quick-ask" disabled={asking} onClick={() => ask("请帮我解释这段原文")}>解释这段</button><button type="button" onClick={() => setSelection(null)} aria-label="移除引用"><CloseIcon /></button></div>}
           <textarea rows={2} value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="问问这本书…" onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); ask(question); } }} />
-          <div><span>Enter 发送 · Shift + Enter 换行</span><button disabled={!question.trim() || asking} aria-label="发送"><SendIcon /></button></div>
+          <div><button type="button" className={`voice-button ${listening ? "listening" : ""}`} onPointerDown={beginListening} onPointerUp={endListening} onPointerLeave={endListening}>{listening ? "松开发送文字" : "按住说话"}</button><span>Enter 发送</span><button disabled={!question.trim() || asking} aria-label="发送"><SendIcon /></button></div>
         </form>
       </aside>
-      {selection && <div className="selection-menu" style={{ left: selection.x, top: selection.y }}><button onClick={() => useSelection()}>加入对话</button><button className="menu-close" onClick={() => setSelection(null)} aria-label="关闭"><CloseIcon /></button></div>}
+      {settingsOpen && companion && <div className="settings-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setSettingsOpen(false); }}>
+        <form className="settings-drawer" onSubmit={saveCompanion}>
+          <header><div><small>阅读偏好</small><h2>设置</h2></div><button type="button" onClick={() => setSettingsOpen(false)} aria-label="关闭设置"><CloseIcon /></button></header>
+          <section><h3>阅读界面</h3>
+            <label>主题<select value={readerPreferences.theme} onChange={(event) => setReaderPreferences({ ...readerPreferences, theme: event.target.value as ReaderPreferences["theme"] })}><option value="paper">纸张</option><option value="night">夜间</option></select></label>
+            <label>亮度 <output>{readerPreferences.brightness}%</output><input type="range" min="70" max="115" value={readerPreferences.brightness} onChange={(event) => setReaderPreferences({ ...readerPreferences, brightness: Number(event.target.value) })} /></label>
+            <label>字号 <output>{readerPreferences.fontSize}px</output><input type="range" min="16" max="28" value={readerPreferences.fontSize} onChange={(event) => setReaderPreferences({ ...readerPreferences, fontSize: Number(event.target.value) })} /></label>
+            <label>行高 <output>{readerPreferences.lineHeight.toFixed(1)}</output><input type="range" min="1.6" max="2.4" step="0.1" value={readerPreferences.lineHeight} onChange={(event) => setReaderPreferences({ ...readerPreferences, lineHeight: Number(event.target.value) })} /></label>
+            <label>正文宽度 <output>{readerPreferences.contentWidth}px</output><input type="range" min="560" max="920" step="20" value={readerPreferences.contentWidth} onChange={(event) => setReaderPreferences({ ...readerPreferences, contentWidth: Number(event.target.value) })} /></label>
+            <button type="button" className="text-action" onClick={() => setReaderPreferences(DEFAULT_READER_PREFERENCES)}>恢复阅读默认值</button>
+          </section>
+          <section><h3>AI 与记忆</h3>
+            <label className="switch-row"><span><strong>长期记忆</strong><small>只保存本书的简短讨论记忆，可随时清除</small></span><input type="checkbox" checked={companion.user_skill.long_term_memory_enabled} onChange={(event) => setCompanion({ ...companion, user_skill: { ...companion.user_skill, long_term_memory_enabled: event.target.checked } })} /></label>
+            <label className="switch-row"><span><strong>防剧透</strong><small>小说默认不使用当前进度之后的内容</small></span><input type="checkbox" checked={companion.user_skill.spoiler_protection} onChange={(event) => setCompanion({ ...companion, user_skill: { ...companion.user_skill, spoiler_protection: event.target.checked } })} /></label>
+            <label>语音速度 <output>{companion.user_skill.voice_rate.toFixed(2)}×</output><input type="range" min="0.7" max="1.4" step="0.05" value={companion.user_skill.voice_rate} onChange={(event) => setCompanion({ ...companion, user_skill: { ...companion.user_skill, voice_rate: Number(event.target.value) } })} /></label>
+            <div className="memory-summary"><span>已保存 {memories.length} 条本书记忆</span><button type="button" onClick={clearMemories} disabled={!memories.length}>清除</button></div>
+          </section>
+          <details><summary>高级阅读方式</summary><section>
+            <label>书籍类型<select value={bookTypeChoice} onChange={(event) => setBookTypeChoice(event.target.value as BookType | "auto")}><option value="auto">自动识别</option><option value="philosophy">哲学与思想</option><option value="history">历史</option><option value="social_science">人文社科</option><option value="science">科学与科普</option><option value="practical">方法与实用</option><option value="fiction">小说与叙事</option><option value="general">通用阅读</option></select></label>
+            <label>回答风格<select value={companion.user_skill.tone} onChange={(event) => setCompanion({ ...companion, user_skill: { ...companion.user_skill, tone: event.target.value as Companion["user_skill"]["tone"] } })}><option value="gentle">温和清楚</option><option value="concise">简洁</option><option value="rigorous">严谨</option></select></label>
+            <label>讲解深度<select value={companion.user_skill.depth} onChange={(event) => setCompanion({ ...companion, user_skill: { ...companion.user_skill, depth: event.target.value as Companion["user_skill"]["depth"] } })}><option value="quick">快速</option><option value="balanced">均衡</option><option value="deep">深入</option></select></label>
+            <label>我的表达偏好<textarea maxLength={400} rows={3} value={companion.user_skill.custom_instructions} onChange={(event) => setCompanion({ ...companion, user_skill: { ...companion.user_skill, custom_instructions: event.target.value } })} placeholder="例如：先讲结论，再举生活化例子" /></label>
+            <p>{companion.skill_summary}</p>
+          </section></details>
+          <footer><button type="button" onClick={() => setSettingsOpen(false)}>取消</button><button disabled={savingSkill}>{savingSkill ? "保存中…" : "保存设置"}</button></footer>
+        </form>
+      </div>}
       <nav className="mobile-tabs"><button className={mobilePane === "toc" ? "active" : ""} onClick={() => setMobilePane("toc")}><MenuIcon />目录</button><button className={mobilePane === "text" ? "active" : ""} onClick={() => setMobilePane("text")}><BookIcon />正文</button><button className={mobilePane === "ai" ? "active" : ""} onClick={() => setMobilePane("ai")}><SparkIcon />一起读</button></nav>
     </div>
   );

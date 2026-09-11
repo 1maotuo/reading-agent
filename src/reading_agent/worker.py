@@ -59,6 +59,23 @@ class InMemoryJobStore:
         self.jobs[job.job_id] = job
         return job
 
+    def list_for_book(self, user_id: UUID, book_id: UUID) -> list[JobRecord]:
+        return [
+            job for job in self.jobs.values()
+            if job.user_id == user_id and job.book_id == book_id
+        ]
+
+    def claim_next(self, worker_id: str, *, lease_seconds: int = 30) -> JobRecord | None:
+        """Claim the oldest available job for the dependency-free worker test."""
+
+        candidates = sorted(self.jobs.values(), key=lambda item: (item.created_at, str(item.job_id)))
+        for job in candidates:
+            if job.status in {JobStatus.QUEUED, JobStatus.RETRY_WAIT}:
+                return JobController(self, clock=lambda: utc_now()).claim(
+                    job.job_id, worker_id, lease_seconds=lease_seconds
+                )
+        return None
+
 
 class JobController:
     def __init__(self, store: InMemoryJobStore | None = None, *, clock: Callable[[], datetime] = utc_now) -> None:
@@ -66,9 +83,29 @@ class JobController:
         self.clock = clock
 
     def add(self, job: JobRecord) -> JobRecord:
-        if job.job_id in self.store.jobs:
+        if self.store.get(job.job_id) is not None:
             raise ContractViolation(ErrorCode.CONFLICT, "job already exists")
         return self.store.save(job)
+
+    def list_for_book(self, user_id: UUID, book_id: UUID) -> list[JobRecord]:
+        list_for_book = getattr(self.store, "list_for_book", None)
+        if callable(list_for_book):
+            return list(list_for_book(user_id, book_id))
+        return []
+
+    def claim_next(self, worker_id: str, *, lease_seconds: int = 30) -> JobRecord | None:
+        """Atomically claim one queued job through the selected store."""
+
+        persistent_claim = getattr(self.store, "claim_next", None)
+        if callable(persistent_claim) and not hasattr(self.store, "jobs"):
+            return persistent_claim(worker_id, lease_seconds=lease_seconds)
+        for job in sorted(
+            getattr(self.store, "jobs", {}).values(),
+            key=lambda item: (item.created_at, str(item.job_id)),
+        ):
+            if job.status in {JobStatus.QUEUED, JobStatus.RETRY_WAIT}:
+                return self.claim(job.job_id, worker_id, lease_seconds=lease_seconds)
+        return None
 
     def get(self, job_id: UUID) -> JobRecord:
         job = self.store.get(job_id)
@@ -81,6 +118,9 @@ class JobController:
         # model_copy(update=...) does not revalidate in Pydantic; validate the
         # full replacement before it enters the store.
         updated = JobRecord.model_validate(updated.model_dump())
+        compare_and_swap = getattr(self.store, "compare_and_swap", None)
+        if callable(compare_and_swap) and not hasattr(self.store, "jobs"):
+            return compare_and_swap(job, updated)
         return self.store.save(updated)
 
     def transition(self, job_id: UUID, target: JobStatus) -> JobRecord:
@@ -119,6 +159,9 @@ class JobController:
             raise ContractViolation(ErrorCode.INVALID_JOB_STATE, "job is not claimable")
         if job.attempts >= 3:
             raise ContractViolation(ErrorCode.INVALID_JOB_STATE, "job attempt limit reached")
+        persistent_claim = getattr(self.store, "claim", None)
+        if callable(persistent_claim) and not hasattr(self.store, "jobs"):
+            return persistent_claim(job_id, worker_id, lease_seconds=lease_seconds)
         return self._replace(
             job,
             status=JobStatus.RUNNING,
@@ -255,5 +298,47 @@ class JobController:
         ):
             self.fail(job_id, worker_id, retryable=False)
             return PublishResult(False, "publish_result_invalid")
-        self.store.save(JobRecord.model_validate(committed.model_dump()))
+        persisted = self.store.get(job_id)
+        if persisted is None or persisted.row_version != committed.row_version:
+            self.store.save(JobRecord.model_validate(committed.model_dump()))
         return PublishResult(True, "published")
+
+
+class JobWorker:
+    """Small bounded worker loop shared by local and PostgreSQL runtimes.
+
+    The handler owns the domain pipeline and must use the controller's lease,
+    checkpoint, and terminal methods.  This class only performs one atomic
+    claim at a time, so a second process cannot run the same queued job.
+    """
+
+    def __init__(
+        self,
+        controller: JobController,
+        *,
+        worker_id: str,
+        handler: Callable[[JobRecord, JobController], None],
+    ) -> None:
+        if not worker_id:
+            raise ContractViolation(ErrorCode.INVALID_INPUT, "worker_id is required")
+        self.controller = controller
+        self.worker_id = worker_id
+        self.handler = handler
+
+    def run_once(self, *, lease_seconds: int = 120) -> JobRecord | None:
+        job = self.controller.claim_next(self.worker_id, lease_seconds=lease_seconds)
+        if job is None:
+            return None
+        try:
+            self.handler(job, self.controller)
+        except ContractViolation as exc:
+            current = self.controller.get(job.job_id)
+            if current.status in {JobStatus.RUNNING, JobStatus.CANCEL_REQUESTED}:
+                self.controller.fail(job.job_id, self.worker_id, retryable=False, error_code=exc.code)
+            raise
+        except Exception:
+            current = self.controller.get(job.job_id)
+            if current.status in {JobStatus.RUNNING, JobStatus.CANCEL_REQUESTED}:
+                self.controller.fail(job.job_id, self.worker_id, retryable=False)
+            raise
+        return self.controller.get(job.job_id)

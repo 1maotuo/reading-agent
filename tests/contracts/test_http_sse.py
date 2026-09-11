@@ -213,6 +213,18 @@ def test_c04_sessions_expiry_logout_csrf_and_non_enumerating_login(fixture_app) 
     assert client.get("/api/v1/session").status_code == 401
 
 
+def test_c04_unicode_password_is_authenticated_and_wrong_password_is_normal_401(fixture_app) -> None:
+    client, services, *_ = fixture_app
+    services.auth.add_account("unicode", "阅读密码", uuid4())
+
+    login = client.post("/api/v1/sessions", json={"identifier": "unicode", "password": "阅读密码"})
+    assert login.status_code == 200, login.text
+
+    wrong_password = client.post("/api/v1/sessions", json={"identifier": "unicode", "password": "错误密码"})
+    assert wrong_password.status_code == 401, wrong_password.text
+    assert wrong_password.json()["error"]["code"] == "unauthenticated"
+
+
 def test_c05_upload_idempotency_format_and_size_contract(fixture_app) -> None:
     client, services, *_ = fixture_app
     multipart = _multipart(client, "multipart", content=b"file", title="Multipart")

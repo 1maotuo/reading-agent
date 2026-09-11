@@ -21,6 +21,7 @@ from uuid import UUID, uuid4, uuid5
 from pydantic import BaseModel
 
 from .api import ApiServices, _AnswerRecord
+from .book_memory import BookMemoryStore
 from .contracts import (
     AnswerRunStatus,
     Block,
@@ -127,11 +128,14 @@ class SQLitePreviewStateStore:
     def _snapshot(services: ApiServices) -> dict[str, Any]:
         books = services.books
         terminal_answers = [
-            record for record in services.answers.records.values() if record.ledger.terminal is not None
+            record
+            for record in services.answers.records.values()
+            if record.ledger.status
+            in {AnswerRunStatus.COMPLETED, AnswerRunStatus.FAILED, AnswerRunStatus.CANCELLED}
         ]
         terminal_jobs = [
             job
-            for job in services.jobs.store.jobs.values()
+            for job in getattr(services.jobs.store, "jobs", {}).values()
             if job.status in {JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED}
         ]
         durable_result_ids = {
@@ -180,6 +184,7 @@ class SQLitePreviewStateStore:
                     "tool_call_count": record.tool_call_count,
                     "error_code": record.error_code.value if record.error_code else None,
                     "intent": record.intent.model_dump(mode="json") if record.intent is not None else None,
+                    "trace_details": record.trace_details,
                 }
                 for record in terminal_answers
             ],
@@ -205,6 +210,9 @@ class SQLitePreviewStateStore:
                 for key, value in services.mutation_idempotency.items()
                 if value[1] in durable_result_ids
             ],
+            "companion": services.companion.dump(),
+            "memory": services.memory.dump(),
+            "book_memory": services.book_memory.dump(),
         }
 
     def save(self, services: ApiServices) -> None:
@@ -337,7 +345,11 @@ class SQLitePreviewStateStore:
                 status = AnswerRunStatus(item.get("status"))
             except (TypeError, ValueError) as exc:
                 raise StateStoreError("persisted answer status is invalid") from exc
-            if status not in {AnswerRunStatus.COMPLETED, AnswerRunStatus.FAILED}:
+            if status not in {
+                AnswerRunStatus.COMPLETED,
+                AnswerRunStatus.FAILED,
+                AnswerRunStatus.CANCELLED,
+            }:
                 raise StateStoreError("persisted answer is not terminal")
             ledger = AnswerEventLedger(
                 run_id=run_id,
@@ -411,10 +423,13 @@ class SQLitePreviewStateStore:
                     )
                 answer_text = str(item.get("answer_text", ""))
                 conversation_id = _uuid(item.get("conversation_id") or uuid5(run_id, "conversation"), "conversation id")
-                ledger.fail(
-                    ErrorCode(item["error_code"]) if item.get("error_code") else ErrorCode.INTERNAL_ERROR,
-                    "历史回答在执行时失败",
-                )
+                if status is AnswerRunStatus.CANCELLED:
+                    ledger.cancel()
+                else:
+                    ledger.fail(
+                        ErrorCode(item["error_code"]) if item.get("error_code") else ErrorCode.INTERNAL_ERROR,
+                        "历史回答在执行时失败",
+                    )
             record = _AnswerRecord(
                 scope=scope,
                 question=str(item.get("question", "")),
@@ -430,6 +445,7 @@ class SQLitePreviewStateStore:
                 tool_call_count=int(item.get("tool_call_count", 0)),
                 error_code=ErrorCode(item["error_code"]) if item.get("error_code") else None,
                 intent=intent,
+                trace_details=dict(item.get("trace_details") or {}),
             )
             if not record.question or scope.book_id not in restored_books:
                 raise StateStoreError("persisted answer scope is invalid")
@@ -463,7 +479,8 @@ class SQLitePreviewStateStore:
             _uuid(key, "deletion book id"): list(value)
             for key, value in raw.get("deletion_steps", {}).items()
         }
-        services.jobs.store.jobs = restored_jobs
+        if hasattr(services.jobs.store, "jobs"):
+            services.jobs.store.jobs = restored_jobs
         services.answers.records = answers
         services.idempotency = {
             (_uuid(item["user_id"], "idempotency user id"), str(item["operation"]), str(item["key"])): (
@@ -480,6 +497,40 @@ class SQLitePreviewStateStore:
             )
             for item in raw.get("mutation_idempotency", [])
         }
+        try:
+            services.companion.restore(raw.get("companion"))
+        except (TypeError, ValueError) as exc:
+            raise StateStoreError("persisted companion state is invalid") from exc
+        try:
+            services.memory.restore(raw.get("memory"))
+        except (TypeError, ValueError) as exc:
+            raise StateStoreError("persisted memory state is invalid") from exc
+        for value in services.memory.records.values():
+            book = restored_books.get(value.book_id)
+            if book is None or book.user_id != value.user_id:
+                raise StateStoreError("persisted memory is outside its book")
+        restored_book_memory = BookMemoryStore()
+        try:
+            restored_book_memory.restore(raw.get("book_memory"))
+        except (TypeError, ValueError) as exc:
+            raise StateStoreError("persisted book memory state is invalid") from exc
+        book_memory_items = (
+            *restored_book_memory.concepts.values(),
+            *restored_book_memory.episodes.values(),
+            *restored_book_memory.signals.values(),
+        )
+        for value in book_memory_items:
+            book = restored_books.get(value.book_id)
+            version = restored_versions.get(value.book_version_id)
+            if (
+                book is None
+                or version is None
+                or book.user_id != value.user_id
+                or version.user_id != value.user_id
+                or version.book_id != value.book_id
+            ):
+                raise StateStoreError("persisted book memory is outside its book version")
+        services.book_memory = restored_book_memory
         return True
 
     @staticmethod

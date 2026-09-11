@@ -62,6 +62,8 @@ from .contracts import (
     QuestionCreate,
     DialogueRoute,
     IntentFrame,
+    IntentTarget,
+    IntentTargetKind,
     SSEEnvelope,
     TraceView,
     Tombstone,
@@ -83,7 +85,11 @@ from .domain import (
     validate_highlight,
 )
 from .worker import JobController
-from .dialogue import IntentRouter
+from .dialogue import HybridIntentRouter
+from .companion import CompanionProfiles, CompanionUpdate, CompanionView
+from .memory import ReadingMemory, ReadingMemoryStore
+from .book_memory import BookLearnerProfileView, BookMemoryStore
+from .storage_boundary import PersistenceBoundary
 
 
 UTC = timezone.utc
@@ -125,7 +131,7 @@ class MemoryAuth:
 
     def login(self, identifier: str, password: str) -> tuple[str, SessionView, str]:
         account = self.accounts.get(identifier)
-        if account is None or not secrets.compare_digest(account[1], password):
+        if account is None or not secrets.compare_digest(account[1].encode("utf-8"), password.encode("utf-8")):
             raise ContractViolation(ErrorCode.UNAUTHENTICATED, "invalid credentials")
         now = utc_now()
         view = SessionView(session_id=uuid4(), user_id=account[0], expires_at=now + timedelta(hours=8))
@@ -143,6 +149,10 @@ class MemoryAuth:
     def csrf_for(self, token: str | None) -> str | None:
         state = self.sessions.get(token or "")
         return state.csrf if state else None
+
+    def validate_csrf(self, token: str | None, csrf: str | None) -> bool:
+        expected = self.csrf_for(token)
+        return expected is not None and csrf is not None and secrets.compare_digest(expected, csrf)
 
     def logout(self, token: str | None) -> None:
         if token:
@@ -385,11 +395,16 @@ class _AnswerRecord:
     tool_call_count: int = 0
     error_code: ErrorCode | None = None
     intent: IntentFrame | None = None
+    cancel_requested: bool = False
+    trace_details: dict[str, Any] = field(default_factory=dict)
 
 
 class MemoryAnswers:
     def __init__(self) -> None:
         self.records: dict[UUID, _AnswerRecord] = {}
+        # Optional normalized sink selected by the Stage 05 runtime.  The
+        # default contract app leaves this unset and remains dependency-free.
+        self.durable_store: Any | None = None
 
     def create(
         self,
@@ -399,12 +414,51 @@ class MemoryAnswers:
         conversation_id: UUID | None = None,
         intent: IntentFrame | None = None,
     ) -> _AnswerRecord:
+        run_id = uuid4()
+        conversation = conversation_id or uuid4()
+        durable = self.durable_store
+        holder: dict[str, _AnswerRecord] = {}
+
+        def persist_event(event: SSEEnvelope) -> None:
+            if durable is None:
+                return
+            durable.append_event(scope, event)
+            record = holder.get("record")
+            if record is None or event.type.value not in {"completed", "failed", "cancelled"}:
+                return
+            status = {
+                "completed": AnswerRunStatus.COMPLETED,
+                "failed": AnswerRunStatus.FAILED,
+                "cancelled": AnswerRunStatus.CANCELLED,
+            }[event.type.value]
+            durable.save_terminal(
+                scope=scope,
+                run_id=record.ledger.run_id,
+                status=status,
+                answer_text=record.answer_text,
+                evidence_ids=record.evidence_ids,
+                conversation_id=record.conversation_id,
+                finished_at=record.finished_at or event.emitted_at,
+                model_name=record.model_name,
+                tool_call_count=record.tool_call_count,
+                error_code=record.error_code,
+            )
+
+        if durable is not None:
+            durable.create_run(
+                scope=scope,
+                run_id=run_id,
+                conversation_id=conversation,
+                question=question,
+                created_at=utc_now(),
+            )
         ledger = AnswerEventLedger(
-            run_id=uuid4(),
+            run_id=run_id,
             trace_id=scope.trace_id,
             request_id=scope.request_id,
             scope=scope,
             evidence_required=intent is None or intent.route is DialogueRoute.BOOK_DIALOGUE,
+            event_sink=persist_event,
         )
         ledger.accepted()
         record = _AnswerRecord(
@@ -412,9 +466,10 @@ class MemoryAnswers:
             question=question,
             ledger=ledger,
             created_at=utc_now(),
-            conversation_id=conversation_id or uuid4(),
+            conversation_id=conversation,
             intent=intent,
         )
+        holder["record"] = record
         self.records[ledger.run_id] = record
         return record
 
@@ -431,6 +486,10 @@ class ApiServices:
     answer_handler: Any | None = None
     dev_mode: bool = False
     dynamic_answer_events: bool = False
+    companion: CompanionProfiles = field(default_factory=CompanionProfiles)
+    memory: ReadingMemoryStore = field(default_factory=ReadingMemoryStore)
+    book_memory: BookMemoryStore = field(default_factory=BookMemoryStore)
+    storage_boundary: PersistenceBoundary | None = None
 
 
 def _services(request: Request) -> ApiServices:
@@ -443,6 +502,11 @@ def get_current_session(request: Request) -> SessionView:
 
 def _csrf(request: Request, services: ApiServices) -> None:
     token = request.cookies.get(SESSION_COOKIE)
+    validator = getattr(services.auth, "validate_csrf", None)
+    if callable(validator):
+        if not validator(token, request.headers.get("X-CSRF-Token")):
+            raise ContractViolation(ErrorCode.CSRF_FAILED, "CSRF validation failed")
+        return
     expected = services.auth.csrf_for(token)
     provided = request.headers.get("X-CSRF-Token")
     if expected is None or provided is None or not secrets.compare_digest(expected, provided):
@@ -490,6 +554,8 @@ def get_chapter_scope(
 def _validate_question_context(services: ApiServices, scope: ScopeContext, payload: QuestionCreate) -> None:
     """Validate all client-supplied question context before any handler runs."""
 
+    if payload.highlight_id is not None and payload.selection_context is not None:
+        raise ContractViolation(ErrorCode.INVALID_INPUT, "一次只能附加一个原文上下文")
     if payload.current_chapter_id is not None:
         chapter = services.books.authorized_chapter(
             user_id=scope.user_id,
@@ -515,6 +581,27 @@ def _validate_question_context(services: ApiServices, scope: ScopeContext, paylo
             is None
         ):
             raise ContractViolation(ErrorCode.NOT_FOUND, "resource not found")
+    if payload.selection_context is not None:
+        selection = payload.selection_context
+        chapter = services.books.authorized_chapter(
+            user_id=scope.user_id,
+            book_id=scope.book_id,
+            book_version_id=scope.book_version_id,
+            chapter_id=selection.chapter_id,
+        )
+        block = services.books.blocks.get(selection.block_id)
+        if (
+            chapter is None
+            or block is None
+            or block.user_id != scope.user_id
+            or block.book_id != scope.book_id
+            or block.book_version_id != scope.book_version_id
+            or block.chapter_id != selection.chapter_id
+            or selection.end_offset > len(block.text)
+            or block.text[selection.start_offset : selection.end_offset] != selection.exact_quote
+            or sha256_text(selection.exact_quote) != selection.text_sha256
+        ):
+            raise ContractViolation(ErrorCode.ANCHOR_INVALID, "所选原文已经变化，请重新选择")
 
 
 class _BookAuthorization:
@@ -726,6 +813,87 @@ def create_app(services: ApiServices | None = None) -> FastAPI:
         response.delete_cookie(CSRF_COOKIE)
         return response
 
+    @router.get("/books/{book_id}/companion", response_model=CompanionView)
+    async def read_companion(
+        book_id: UUID,
+        session: SessionView = Depends(get_current_session),
+    ) -> CompanionView:
+        book = app.state.services.books.owned(book_id, session.user_id)
+        if book is None:
+            raise ContractViolation(ErrorCode.NOT_FOUND, "resource not found")
+        return app.state.services.companion.view(user_id=session.user_id, book_id=book_id)
+
+    @router.put("/books/{book_id}/companion", response_model=CompanionView)
+    async def update_companion(
+        book_id: UUID,
+        request: Request,
+        payload: dict[str, Any] = Body(...),
+        session: SessionView = Depends(get_current_session),
+    ) -> CompanionView:
+        _csrf(request, app.state.services)
+        book = app.state.services.books.owned(book_id, session.user_id)
+        if book is None:
+            raise ContractViolation(ErrorCode.NOT_FOUND, "resource not found")
+        update = await _decode_json_body(request, CompanionUpdate)
+        return app.state.services.companion.update(user_id=session.user_id, book_id=book_id, payload=update)
+
+    @router.get("/books/{book_id}/memories", response_model=list[ReadingMemory])
+    async def list_reading_memories(
+        book_id: UUID,
+        session: SessionView = Depends(get_current_session),
+    ) -> list[ReadingMemory]:
+        book = app.state.services.books.owned(book_id, session.user_id)
+        if book is None:
+            raise ContractViolation(ErrorCode.NOT_FOUND, "resource not found")
+        return app.state.services.memory.list_for_book(user_id=session.user_id, book_id=book_id)
+
+    @router.get("/books/{book_id}/book-memory", response_model=BookLearnerProfileView)
+    async def read_book_memory(
+        book_id: UUID,
+        session: SessionView = Depends(get_current_session),
+    ) -> BookLearnerProfileView:
+        book = app.state.services.books.owned(book_id, session.user_id)
+        if book is None:
+            raise ContractViolation(ErrorCode.NOT_FOUND, "resource not found")
+        version_id = app.state.services.books.active_version(book)
+        return app.state.services.book_memory.build_profile_view(
+            user_id=session.user_id,
+            book_id=book_id,
+            book_version_id=version_id,
+        )
+
+    @router.delete("/books/{book_id}/book-memory")
+    async def clear_book_memory(
+        book_id: UUID,
+        request: Request,
+        session: SessionView = Depends(get_current_session),
+    ) -> dict[str, int]:
+        _csrf(request, app.state.services)
+        book = app.state.services.books.owned(book_id, session.user_id)
+        if book is None:
+            raise ContractViolation(ErrorCode.NOT_FOUND, "resource not found")
+        return {
+            "deleted": app.state.services.book_memory.clear_scope(
+                user_id=session.user_id, book_id=book_id
+            )
+        }
+
+    @router.delete("/books/{book_id}/memories")
+    async def clear_reading_memories(
+        book_id: UUID,
+        request: Request,
+        session: SessionView = Depends(get_current_session),
+    ) -> dict[str, int]:
+        _csrf(request, app.state.services)
+        book = app.state.services.books.owned(book_id, session.user_id)
+        if book is None:
+            raise ContractViolation(ErrorCode.NOT_FOUND, "resource not found")
+        deleted = app.state.services.memory.clear_book(user_id=session.user_id, book_id=book_id)
+        deleted += app.state.services.book_memory.clear_scope(
+            user_id=session.user_id, book_id=book_id
+        )
+        return {"deleted": deleted}
+
     @router.post(
         "/books",
         response_model=BookCreateResponse,
@@ -795,6 +963,9 @@ def create_app(services: ApiServices | None = None) -> FastAPI:
             created_at=now,
             updated_at=now,
         )
+        boundary = app.state.services.storage_boundary
+        if boundary is not None and boundary.normalized_adapters_ready:
+            boundary.create_book(book)
         app.state.services.books.add_book(book)
         app.state.services.jobs.add(job)
         app.state.services.idempotency[key] = (body_hash, book.book_id, job.job_id)
@@ -849,7 +1020,7 @@ def create_app(services: ApiServices | None = None) -> FastAPI:
         services.books.tombstones[book_id] = tombstone
         services.books.deletion_steps[book_id] = ["tombstone", "revoke"]
         services.books.deletion_steps[book_id].append("cancel")
-        for existing in list(services.jobs.store.jobs.values()):
+        for existing in services.jobs.list_for_book(session.user_id, book_id):
             if (
                 existing.user_id == session.user_id
                 and existing.book_id == book_id
@@ -964,8 +1135,12 @@ def create_app(services: ApiServices | None = None) -> FastAPI:
         request: Request,
         scope: ScopeContext = Depends(get_chapter_scope),
     ) -> ReadingProgress:
-        key = (scope.user_id, scope.book_version_id, chapter_id)
-        result = app.state.services.books.progress.get(key)
+        boundary = app.state.services.storage_boundary
+        if boundary is not None and boundary.progress_storage_ready:
+            result = boundary.get_progress(scope)
+        else:
+            key = (scope.user_id, scope.book_version_id, chapter_id)
+            result = app.state.services.books.progress.get(key)
         if result is None:
             raise ContractViolation(ErrorCode.NOT_FOUND, "progress not found")
         return result
@@ -1003,6 +1178,25 @@ def create_app(services: ApiServices | None = None) -> FastAPI:
             chapter_id=payload.chapter_id,
             authorization=_BookAuthorization(app.state.services.books),
         )
+        boundary = app.state.services.storage_boundary
+        if boundary is not None and boundary.progress_storage_ready:
+            progress = ReadingProgress(
+                book_id=scope.book_id,
+                user_id=scope.user_id,
+                book_version_id=scope.book_version_id,
+                chapter_id=payload.chapter_id,
+                last_chunk_index=payload.last_chunk_index,
+                furthest_chunk_index=payload.furthest_chunk_index,
+                position=payload.position,
+                updated_at=utc_now(),
+                row_version=max(1, if_match),
+            )
+            result = boundary.put_progress(scope, progress, if_match)
+            # Keep scope construction and same-process reads aligned with the
+            # durable optimistic-lock result while PostgreSQL remains the
+            # source of truth for progress.
+            app.state.services.books.progress[(scope.user_id, scope.book_version_id, payload.chapter_id)] = result
+            return result
         return app.state.services.books.put_progress(scope, payload, if_match)
 
     @router.get("/books/{book_id}/highlights", response_model=HighlightPage)
@@ -1120,14 +1314,40 @@ def create_app(services: ApiServices | None = None) -> FastAPI:
         else:
             conversation_records = []
         previous_route = None
+        previous_intent = None
+        previous_question = None
+        previous_answer = None
         if conversation_records:
             previous = max(conversation_records, key=lambda item: item.created_at)
             previous_route = previous.intent.route if previous.intent is not None else DialogueRoute.BOOK_DIALOGUE
-        intent = IntentRouter().classify(
+            previous_intent = previous.intent
+            previous_question = previous.question
+            previous_answer = previous.answer_text
+        explicit_target = None
+        if payload.selection_context is not None:
+            explicit_target = IntentTarget(
+                kind=IntentTargetKind.SELECTION,
+                identifier=str(payload.selection_context.block_id),
+                explicit=True,
+            )
+        elif payload.highlight_id is not None:
+            explicit_target = IntentTarget(
+                kind=IntentTargetKind.HIGHLIGHT,
+                identifier=str(payload.highlight_id),
+                explicit=True,
+            )
+        semantic_model = getattr(answer_services.answer_handler, "model", None)
+        intent = await asyncio.to_thread(
+            HybridIntentRouter(semantic_model).classify,
             payload.question,
-            has_highlight=payload.highlight_id is not None,
+            has_selection=payload.highlight_id is not None or payload.selection_context is not None,
             has_current_view=payload.current_chapter_id is not None,
             previous_route=previous_route,
+            explicit_target=explicit_target,
+            current_chapter_id=str(payload.current_chapter_id) if payload.current_chapter_id else None,
+            previous_intent=previous_intent,
+            previous_question=previous_question,
+            previous_answer=previous_answer,
         )
         body_hash = canonical_sha256(payload.model_dump(mode="json"))
         key = (scope.user_id, "create_question", idempotency_key)
@@ -1209,6 +1429,34 @@ def create_app(services: ApiServices | None = None) -> FastAPI:
 
         return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
 
+    @router.post("/answer-runs/{run_id}/cancel", response_model=AnswerRunView, status_code=202)
+    async def cancel_answer_run(
+        run_id: UUID,
+        request: Request,
+        session: SessionView = Depends(get_current_session),
+    ) -> AnswerRunView:
+        _csrf(request, app.state.services)
+        record = app.state.services.answers.records.get(run_id)
+        if record is None or record.scope.user_id != session.user_id:
+            raise ContractViolation(ErrorCode.NOT_FOUND, "resource not found")
+        if record.ledger.terminal is None:
+            handler = app.state.services.answer_handler
+            if handler is not None and hasattr(handler, "cancel"):
+                handler.cancel(record)
+            else:
+                record.cancel_requested = True
+            record.ledger.cancel()
+            record.finished_at = datetime.now(timezone.utc)
+        return AnswerRunView(
+            run_id=record.ledger.run_id,
+            book_id=record.scope.book_id,
+            status=record.ledger.status,
+            trace_id=record.scope.trace_id,
+            created_at=record.created_at,
+            conversation_id=record.conversation_id,
+            intent=record.intent or HybridIntentRouter().classify(record.question),
+        )
+
     @router.get("/answer-runs/{run_id}/evidence", response_model=EvidenceBundle)
     async def read_answer_evidence(
         run_id: UUID,
@@ -1275,6 +1523,11 @@ def create_app(services: ApiServices | None = None) -> FastAPI:
                     model_name=record.model_name,
                     tool_call_count=record.tool_call_count,
                     error_code=record.error_code,
+                    intent=record.intent,
+                    context=dict(record.trace_details.get("context", {})),
+                    stream_mode=record.trace_details.get("stream_mode"),
+                    memory_hits=int(record.trace_details.get("memory_hits", 0)),
+                    skill_version=record.trace_details.get("skill_version"),
                 )
         raise ContractViolation(ErrorCode.NOT_FOUND, "resource not found")
 

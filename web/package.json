@@ -1,7 +1,7 @@
 {
   "name": "reading-agent-web",
   "private": true,
-  "version": "0.0.6-stage05-conversation-preview",
+  "version": "0.0.8-stage05-agent-core-v1",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",

@@ -11,7 +11,28 @@ import pytest
 from fastapi.testclient import TestClient
 
 from reading_agent.api import ApiServices, CSRF_COOKIE, DEFAULT_USER_ID
-from reading_agent.contracts import Book, BookFormat
+from reading_agent.book_memory import (
+    BookConcept,
+    EpisodeStatus,
+    LearningDimension,
+    LearningEpisode,
+    LearningSignal,
+    LearningSignalType,
+    SignalPolarity,
+    SignalSource,
+    SignalStrength,
+    SignalValidation,
+    UnderstandingState,
+)
+from reading_agent.contracts import (
+    Book,
+    BookFormat,
+    BookVersion,
+    BookVersionStatus,
+    FrictionType,
+    LearningGoal,
+    ResponseStrategy,
+)
 from reading_agent.domain import utc_now
 from reading_agent.persistence import SQLitePreviewStateStore, StateStoreError
 from reading_agent.stage05 import DEMO_IDENTIFIER, DEMO_PASSWORD, create_stage05_app
@@ -211,3 +232,85 @@ def test_concurrent_saves_cannot_let_an_old_snapshot_win(tmp_path: Path) -> None
     restored = ApiServices()
     assert store.load(restored)
     assert set(restored.books.books) == {first.book_id, second.book_id}
+
+
+def test_book_memory_snapshot_survives_preview_restart(tmp_path: Path) -> None:
+    services = ApiServices()
+    store = SQLitePreviewStateStore(tmp_path / "state.sqlite3")
+    book_id = uuid4()
+    version_id = uuid4()
+    book = Book(
+        book_id=book_id,
+        user_id=DEFAULT_USER_ID,
+        title="记忆持久化测试书",
+        format=BookFormat.MARKDOWN,
+        active_version_id=version_id,
+        created_at=utc_now(),
+        row_version=1,
+    )
+    version = BookVersion(
+        book_version_id=version_id,
+        book_id=book_id,
+        user_id=DEFAULT_USER_ID,
+        file_sha256="0" * 64,
+        pipeline_version="test",
+        status=BookVersionStatus.READY,
+        created_at=utc_now(),
+        published_at=utc_now(),
+    )
+    services.books.add_book(book)
+    services.books.add_version(version)
+    concept = services.book_memory.add_concept(
+        BookConcept(
+            user_id=DEFAULT_USER_ID,
+            book_id=book_id,
+            book_version_id=version_id,
+            canonical_name="因果关系",
+        )
+    )
+    episode = services.book_memory.commit_episode(
+        LearningEpisode(
+            user_id=DEFAULT_USER_ID,
+            book_id=book_id,
+            book_version_id=version_id,
+            conversation_id=uuid4(),
+            answer_run_id=uuid4(),
+            concept_id=concept.concept_id,
+            learning_goal=LearningGoal.UNDERSTAND,
+            friction_type=FrictionType.LOGIC,
+            question_summary="我不明白这一步",
+            response_strategy=ResponseStrategy.RECONSTRUCT,
+            status=EpisodeStatus.CONFIRMED,
+        ),
+        completed=True,
+    )
+    assert episode is not None
+    services.book_memory.add_signal(
+        LearningSignal(
+            episode_id=episode.episode_id,
+            user_id=DEFAULT_USER_ID,
+            book_id=book_id,
+            book_version_id=version_id,
+            concept_id=concept.concept_id,
+            dimension=LearningDimension.ARGUMENT,
+            signal_type=LearningSignalType.CORRECT_RECONSTRUCTION,
+            polarity=SignalPolarity.POSITIVE,
+            strength=SignalStrength.STRONG,
+            source_kind=SignalSource.OBSERVED_BEHAVIOR,
+            evidence_quote="用户独立重建了论证链",
+            validation_status=SignalValidation.ACCEPTED,
+        )
+    )
+
+    store.save(services)
+    restored = ApiServices()
+    assert store.load(restored)
+    assert len(restored.book_memory.episodes) == 1
+    assert len(restored.book_memory.signals) == 1
+    assert restored.book_memory.get_state(
+        user_id=DEFAULT_USER_ID,
+        book_id=book_id,
+        book_version_id=version_id,
+        concept_id=concept.concept_id,
+        dimension=LearningDimension.ARGUMENT,
+    ).state is UnderstandingState.VERIFIED

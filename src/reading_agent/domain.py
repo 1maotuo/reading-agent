@@ -32,12 +32,14 @@ from .contracts import (
     ScopeContext,
     SSEAcceptedPayload,
     SSEAnswerDeltaPayload,
+    SSECancelledPayload,
     SSECompletedPayload,
     SSEEvidencePayload,
     SSEEnvelope,
     SSEEventType,
     SSEFailedPayload,
     SSEHeartbeatPayload,
+    SSEStatusPayload,
     SSEToolFinishedPayload,
     SSEToolStartedPayload,
     ToolArgs,
@@ -510,6 +512,7 @@ class AnswerEventLedger:
         scope: ScopeContext | None = None,
         evidence_required: bool = True,
         clock: Callable[[], datetime] = utc_now,
+        event_sink: Callable[[SSEEnvelope], None] | None = None,
     ) -> None:
         self.run_id = run_id
         self.trace_id = trace_id
@@ -517,6 +520,7 @@ class AnswerEventLedger:
         self._scope_key = scope_identity_key(scope) if scope is not None else None
         self.evidence_required = evidence_required
         self._clock = clock
+        self._event_sink = event_sink
         self._events: list[SSEEnvelope] = []
         self._started_tools: dict[UUID, ToolName] = {}
         self._finished_tools: set[UUID] = set()
@@ -559,6 +563,11 @@ class AnswerEventLedger:
             type=event_type,
             payload=payload_dict,
         )
+        # Persist before publishing the event to the in-process replay list.
+        # A durable sink failure therefore cannot make the API claim that an
+        # event was accepted when the normalized answer ledger rejected it.
+        if self._event_sink is not None:
+            self._event_sink(envelope)
         self._events.append(envelope)
         return envelope
 
@@ -566,6 +575,14 @@ class AnswerEventLedger:
         if self._events:
             raise ContractViolation(ErrorCode.CONFLICT, "accepted event already emitted")
         return self._append(SSEEventType.ACCEPTED, SSEAcceptedPayload())
+
+    def phase(
+        self,
+        phase: Literal["understanding", "searching", "generating", "saving"],
+        label: str,
+    ) -> SSEEnvelope:
+        self.status = AnswerRunStatus.RUNNING
+        return self._append(SSEEventType.STATUS, SSEStatusPayload(phase=phase, label=label))
 
     def start_tool(self, call_id: UUID, name: ToolName) -> SSEEnvelope:
         self._ensure_open()
@@ -688,6 +705,14 @@ class AnswerEventLedger:
         """Convert ordinary handler exceptions to failed, never cancelled."""
 
         return self.fail(ErrorCode.INTERNAL_ERROR, "answer run failed")
+
+    def cancel(self, reason: str = "已停止生成") -> SSEEnvelope:
+        if self._terminal is not None:
+            return self._events[-1]
+        envelope = self._append(SSEEventType.CANCELLED, SSECancelledPayload(reason=reason))
+        self._terminal = SSEEventType.CANCELLED
+        self.status = AnswerRunStatus.CANCELLED
+        return envelope
 
     def heartbeat(self) -> SSEEnvelope:
         return self._append(SSEEventType.HEARTBEAT, SSEHeartbeatPayload())
