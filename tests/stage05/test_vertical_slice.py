@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi.testclient import TestClient
 
@@ -205,7 +205,12 @@ def test_s05_07_reading_scope_blocks_unadvanced_chunk_until_progress_moves(tmp_p
         chapter_id = chapter["chapter_id"]
         blocks = client.get(f"/api/v1/books/{book_id}/chapters/{chapter_id}/blocks").json()["items"]
         first = blocks[0]
-        later = next(item for item in blocks[1:] if item["ordinal"] > first["ordinal"])
+        first_chunk_index = app.state.services.books.block_chunk_indexes[UUID(first["block_id"])]
+        later = next(
+            item
+            for item in blocks[1:]
+            if app.state.services.books.block_chunk_indexes[UUID(item["block_id"])] > first_chunk_index
+        )
 
         progress = client.get(f"/api/v1/books/{book_id}/progress", params={"chapter_id": chapter_id})
         assert progress.status_code == 200

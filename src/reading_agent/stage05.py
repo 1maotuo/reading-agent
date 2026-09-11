@@ -8,7 +8,6 @@ MinIO source objects while retaining the frozen contract objects in-process.
 
 from __future__ import annotations
 
-import math
 import inspect
 import json
 import os
@@ -87,13 +86,15 @@ from .postgres_adapter import (
     PostgresJobStore,
     PostgresPublishTransaction,
 )
+from .retrieval import bm25_rank, merge_section_blocks
 from .storage_boundary import PersistenceBoundary
 from .worker import JobController
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEVELOPMENT_PIPELINE = "stage05-local-preview-1"
-DEVELOPMENT_RETRIEVAL = "local-lexical-preview-1"
+DEVELOPMENT_PIPELINE = "stage05-local-preview-2"
+DEVELOPMENT_RETRIEVAL = "local-bm25-preview-1"
+DEVELOPMENT_CHUNKER = "section-structure-chunker-v1"
 DEMO_IDENTIFIER = os.environ.get("READING_AGENT_PREVIEW_EMAIL", "reader@example.local")
 DEMO_PASSWORD = os.environ.get("READING_AGENT_PREVIEW_PASSWORD", "reading-demo")
 
@@ -200,7 +201,6 @@ class Stage05UploadHandler:
             block_count = 0
             chunk_count = 0
             first_block_by_chapter: dict[UUID, Block] = {}
-            last_chunk_by_chapter: dict[UUID, int] = {}
             for parsed_chapter in parsed.chapters:
                 chapter_id = uuid5(version_id, parsed_chapter.chapter_id)
                 parsed_blocks = [
@@ -220,6 +220,7 @@ class Stage05UploadHandler:
                     source_locator=_source_locator(parsed_blocks[0].source_anchor.locator),
                 )
                 services.books.add_chapter(chapter)
+                blocks_by_source_id: dict[str, Block] = {}
                 for parsed_block in parsed_blocks:
                     block_id = uuid5(version_id, parsed_block.block_id)
                     block = Block(
@@ -234,28 +235,32 @@ class Stage05UploadHandler:
                         source_locator=_source_locator(parsed_block.source_anchor.locator),
                     )
                     services.books.add_block(block)
+                    blocks_by_source_id[parsed_block.block_id] = block
                     first_block_by_chapter.setdefault(chapter_id, block)
 
-                    # One Block per preview Chunk keeps source restoration and
-                    # progress deterministic.  Production chunk sizing remains
-                    # behind the repository adapter and F-03-02 gate.
-                    chunk_index = parsed_block.ordinal
+                    block_count += 1
+
+                for group in merge_section_blocks(parsed_chapter.sections):
+                    group_blocks = [blocks_by_source_id[block_id] for block_id in group.block_ids]
+                    chunk_index = group.first_ordinal
                     chunk = Chunk(
-                        chunk_id=uuid5(version_id, f"chunk:{parsed_block.block_id}"),
+                        chunk_id=uuid5(
+                            version_id,
+                            f"chunk:{DEVELOPMENT_CHUNKER}:{DEVELOPMENT_RETRIEVAL}:"
+                            f"{','.join(str(block.block_id) for block in group_blocks)}",
+                        ),
                         chapter_id=chapter_id,
                         book_id=book.book_id,
                         user_id=book.user_id,
                         book_version_id=version_id,
                         chunk_index=chunk_index,
-                        block_ids=[block_id],
-                        text_sha256=sha256_text(parsed_block.text),
-                        token_count=max(1, math.ceil(len(parsed_block.text) / 3)),
+                        block_ids=[block.block_id for block in group_blocks],
+                        text_sha256=sha256_text(group.text),
+                        token_count=group.token_count,
                         embedding_model=DEVELOPMENT_RETRIEVAL,
-                        chunker_version=DEVELOPMENT_PIPELINE,
+                        chunker_version=DEVELOPMENT_CHUNKER,
                     )
-                    services.books.add_chunk(chunk, parsed_block.text)
-                    last_chunk_by_chapter[chapter_id] = chunk_index
-                    block_count += 1
+                    services.books.add_chunk(chunk, group.text)
                     chunk_count += 1
 
             if not block_count:
@@ -415,40 +420,14 @@ class Stage05UploadHandler:
                     services.jobs.fail(job.job_id, worker_id, retryable=False)
 
 
-_LATIN_WORD = re.compile(r"[a-z0-9]+", re.IGNORECASE)
-_CJK_RUN = re.compile(r"[\u3400-\u9fff]+")
-
-
-def _search_terms(value: str) -> set[str]:
-    normalized = value.casefold()
-    terms = set(_LATIN_WORD.findall(normalized))
-    for run in _CJK_RUN.findall(normalized):
-        terms.update(run)
-        terms.update(run[index : index + 2] for index in range(max(0, len(run) - 1)))
-    return {term for term in terms if term.strip()}
-
-
-def _lexical_score(query: str, text: str) -> float:
-    query_terms = _search_terms(query)
-    text_terms = _search_terms(text)
-    if not query_terms or not text_terms:
-        return 0.0
-    overlap = len(query_terms & text_terms)
-    score = overlap / math.sqrt(max(1, len(query_terms) * len(text_terms)))
-    compact_query = re.sub(r"\s+", "", query.casefold())
-    compact_text = re.sub(r"\s+", "", text.casefold())
-    if compact_query and compact_query in compact_text:
-        score += 1.0
-    return score
-
-
 class LocalBookToolProvider:
     """Scope-bound deterministic retrieval used only for the Stage 05 preview."""
 
     def __init__(self, services: ApiServices) -> None:
         self.services = services
 
-    def _chunks(self, scope: ScopeContext) -> list[Chunk]:
+    def _chunks(self, scope: ScopeContext, chapter_ids: Iterable[UUID] | None = None) -> list[Chunk]:
+        requested_chapters = set(chapter_ids) if chapter_ids is not None else None
         return sorted(
             (
                 chunk
@@ -457,19 +436,20 @@ class LocalBookToolProvider:
                 and chunk.book_id == scope.book_id
                 and chunk.book_version_id == scope.book_version_id
                 and (scope.chapter_id is None or chunk.chapter_id == scope.chapter_id)
+                and (requested_chapters is None or chunk.chapter_id in requested_chapters)
                 and (scope.furthest_chunk_index is None or chunk.chunk_index <= scope.furthest_chunk_index)
             ),
-            key=lambda item: item.chunk_index,
+            key=lambda item: (item.chunk_index, str(item.chunk_id)),
         )
 
     def best_chapter(self, scope: ScopeContext, query: str) -> UUID | None:
-        scored = [
-            (_lexical_score(query, self.services.books.chunk_texts[chunk.chunk_id]), chunk.chapter_id)
-            for chunk in self._chunks(scope)
-        ]
-        if not scored:
+        ranked = bm25_rank(
+            query,
+            [(chunk, self.services.books.chunk_texts[chunk.chunk_id]) for chunk in self._chunks(scope)],
+        )
+        if not ranked:
             return None
-        return max(scored, key=lambda item: item[0])[1]
+        return ranked[0][1].chapter_id
 
     def _evidence_for(self, scope: ScopeContext, chunk: Chunk) -> EvidenceRef:
         text = self.services.books.chunk_texts[chunk.chunk_id]
@@ -492,22 +472,22 @@ class LocalBookToolProvider:
 
     def call(self, name: ToolName, args: Any, scope: ScopeContext, call_id: UUID) -> ToolResult:
         if name is ToolName.SEARCH_BOOK and isinstance(args, SearchBookArgs):
-            ranked = sorted(
-                (
-                    (_lexical_score(args.query, self.services.books.chunk_texts[chunk.chunk_id]), chunk)
-                    for chunk in self._chunks(scope)
-                ),
-                key=lambda item: (item[0], -item[1].chunk_index),
-                reverse=True,
+            ranked = bm25_rank(
+                args.query,
+                [
+                    (chunk, self.services.books.chunk_texts[chunk.chunk_id])
+                    for chunk in self._chunks(scope, args.chapter_ids)
+                ],
+                top_k=args.top_k,
             )
-            selected = [item for _, item in ranked[: args.top_k]]
-            if not selected:
+            if not ranked:
                 return ToolResult(
                     call_id=call_id,
                     name=name,
                     status=ToolCallStatus.FAILED,
                     error=ToolError(code=ErrorCode.EVIDENCE_REQUIRED, message="当前范围内没有可用原文证据"),
                 )
+            selected = [item for _, item in ranked]
             refs = [self._evidence_for(scope, chunk) for chunk in selected]
             return ToolResult(
                 call_id=call_id,
@@ -544,14 +524,14 @@ class LocalBookToolProvider:
                     status=ToolCallStatus.FAILED,
                     error=ToolError(code=ErrorCode.EVIDENCE_REQUIRED, message="没有找到对应原文"),
                 )
-            refs = [
-                self._evidence_for(scope, self.services.books.chunks[next(
-                    chunk_id
-                    for chunk_id, chunk in self.services.books.chunks.items()
+            refs_by_chunk: dict[UUID, EvidenceRef] = {}
+            for block in blocks:
+                chunk = next(
+                    chunk for chunk in self.services.books.chunks.values()
                     if block.block_id in chunk.block_ids
-                )])
-                for block in blocks
-            ]
+                )
+                refs_by_chunk.setdefault(chunk.chunk_id, self._evidence_for(scope, chunk))
+            refs = list(refs_by_chunk.values())
             return ToolResult(
                 call_id=call_id,
                 name=name,
