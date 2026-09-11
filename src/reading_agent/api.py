@@ -169,6 +169,8 @@ class MemoryBooks:
         self.blocks: dict[UUID, Block] = {}
         self.chunks: dict[UUID, Any] = {}
         self.chunk_texts: dict[UUID, str] = {}
+        # Optional retrieval sidecar; absence means BM25-only/legacy content.
+        self.chunk_embeddings: dict[UUID, list[float]] = {}
         self.block_chunk_indexes: dict[UUID, int] = {}
         self.evidence: dict[UUID, EvidenceRef] = {}
         self.source_paths: dict[UUID, str] = {}
@@ -191,9 +193,11 @@ class MemoryBooks:
     def add_block(self, block: Block) -> None:
         self.blocks[block.block_id] = block
 
-    def add_chunk(self, chunk: Any, text: str) -> None:
+    def add_chunk(self, chunk: Any, text: str, embedding: list[float] | None = None) -> None:
         self.chunks[chunk.chunk_id] = chunk
         self.chunk_texts[chunk.chunk_id] = text
+        if embedding is not None:
+            self.chunk_embeddings[chunk.chunk_id] = list(embedding)
         for block_id in chunk.block_ids:
             self.block_chunk_indexes[block_id] = chunk.chunk_index
 

@@ -46,6 +46,7 @@ from .contracts import (
     IntentFrame,
 )
 from .domain import AnswerEventLedger, issue_verified_evidence_token, sha256_text
+from .retrieval import validate_embeddings, EMBEDDING_DIMENSION
 
 
 SCHEMA_VERSION = 1
@@ -151,6 +152,7 @@ class SQLitePreviewStateStore:
             "blocks": [_model_json(value) for value in books.blocks.values()],
             "chunks": [_model_json(value) for value in books.chunks.values()],
             "chunk_texts": {str(key): value for key, value in books.chunk_texts.items()},
+            "chunk_embeddings": {str(key): value for key, value in books.chunk_embeddings.items()},
             "source_paths": {str(key): value for key, value in books.source_paths.items()},
             "progress": [_model_json(value) for value in books.progress.values()],
             "highlights": [_model_json(value) for value in books.highlights.values()],
@@ -315,6 +317,13 @@ class SQLitePreviewStateStore:
         chunk_texts = {
             _uuid(key, "chunk text id"): value for key, value in raw.get("chunk_texts", {}).items()
         }
+        chunk_embeddings: dict[UUID, list[float]] = {}
+        for key, value in (raw.get("chunk_embeddings", {}) or {}).items():
+            chunk_id = _uuid(key, "chunk embedding id")
+            try:
+                chunk_embeddings[chunk_id] = validate_embeddings([value], expected_count=1)[0]
+            except (TypeError, ValueError) as exc:
+                raise StateStoreError("invalid persisted chunk embedding") from exc
         source_paths = {
             _uuid(key, "source path book id"): str(value)
             for key, value in raw.get("source_paths", {}).items()
@@ -334,6 +343,8 @@ class SQLitePreviewStateStore:
             restored_evidence,
             restored_jobs,
         )
+        if any(key not in restored_chunks for key in chunk_embeddings):
+            raise StateStoreError("persisted chunk embedding references missing chunk")
 
         answers: dict[UUID, _AnswerRecord] = {}
         for item in raw.get("answers", []):
@@ -464,6 +475,7 @@ class SQLitePreviewStateStore:
         services.books.blocks = restored_blocks
         services.books.chunks = restored_chunks
         services.books.chunk_texts = chunk_texts
+        services.books.chunk_embeddings = chunk_embeddings
         services.books.block_chunk_indexes = {
             block_id: chunk.chunk_index for chunk in restored_chunks.values() for block_id in chunk.block_ids
         }

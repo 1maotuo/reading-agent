@@ -340,6 +340,7 @@ class PostgresBookRepository(BookRepositoryPort):
         chunks: Iterable[Chunk],
         chunk_texts: dict[UUID, str],
         progress: Iterable[ReadingProgress],
+        embeddings: dict[UUID, list[float]] | None = None,
     ) -> None:
         """Write one parsed version and all dependent rows in one transaction."""
 
@@ -347,6 +348,10 @@ class PostgresBookRepository(BookRepositoryPort):
         blocks = list(blocks)
         chunks = list(chunks)
         progress = list(progress)
+        embeddings = embeddings or {}
+        for value in embeddings.values():
+            from .retrieval import validate_embeddings
+            validate_embeddings([value], expected_count=1)
         if not chapters or not blocks or not chunks:
             raise ContractViolation(ErrorCode.INVALID_INPUT, "book content bundle is empty")
         with self.database.transaction() as connection:
@@ -400,14 +405,16 @@ class PostgresBookRepository(BookRepositoryPort):
                     """
                     INSERT INTO chunks
                         (chunk_id, user_id, book_id, book_version_id, chapter_id, chunk_index,
-                         block_ids, text_sha256, token_count, embedding_model, chunker_version, search_text)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s)
+                         block_ids, text_sha256, token_count, embedding_model, chunker_version, search_text, embedding)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         chunk.chunk_id, chunk.user_id, chunk.book_id, chunk.book_version_id,
                         chunk.chapter_id, chunk.chunk_index,
                         json.dumps([str(value) for value in chunk.block_ids]), chunk.text_sha256,
                         chunk.token_count, chunk.embedding_model, chunk.chunker_version, text,
+                        ("[" + ",".join(str(value) for value in embeddings[chunk.chunk_id]) + "]"
+                         if chunk.chunk_id in embeddings else None),
                     ),
                 )
             for item in progress:
@@ -566,6 +573,35 @@ class PostgresBookRepository(BookRepositoryPort):
             ]
             result.append(Chunk.model_validate(row))
         return result
+
+    def search_embeddings(self, scope: ScopeContext, query_embedding: list[float], *, top_k: int = 40,
+                          chapter_ids: Iterable[UUID] | None = None) -> list[tuple[float, UUID]]:
+        """Scoped pgvector cosine search; callers still validate local scope."""
+        from .retrieval import validate_embeddings
+        validate_embeddings([query_embedding], expected_count=1)
+        if not 1 <= top_k <= 100:
+            raise ContractViolation(ErrorCode.INVALID_INPUT, "top_k is outside the allowed range")
+        allowed = list(chapter_ids or [])
+        clause = "c.user_id = %s AND c.book_id = %s AND c.book_version_id = %s AND c.embedding IS NOT NULL"
+        params: list[Any] = [scope.user_id, scope.book_id, scope.book_version_id]
+        if scope.chapter_id is not None:
+            clause += " AND c.chapter_id = %s"
+            params.append(scope.chapter_id)
+        if allowed:
+            clause += " AND c.chapter_id = ANY(%s)"
+            params.append(allowed)
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                f"SELECT c.chunk_id, 1 - (c.embedding <=> %s::vector) AS score FROM chunks c "
+                f"JOIN book_versions v ON v.user_id = c.user_id AND v.book_id = c.book_id "
+                f"AND v.book_version_id = c.book_version_id JOIN books b ON b.user_id = c.user_id "
+                f"AND b.book_id = c.book_id WHERE {clause} AND v.status = 'ready' "
+                f"AND b.status = 'active' AND b.active_version_id = c.book_version_id "
+                "ORDER BY c.embedding <=> %s::vector, c.chunk_id LIMIT %s",
+                (str(query_embedding), *params, str(query_embedding), top_k),
+            ).fetchall()
+        return [(float(row["score"]), _strict_uuid(row["chunk_id"], "embedding chunk_id"))
+                for row in rows if float(row["score"]) > 0]
 
     def read_blocks_by_ids(self, scope: ScopeContext, block_ids: list[UUID]) -> list[Block]:
         if not block_ids or len(block_ids) > 100:

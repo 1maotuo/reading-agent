@@ -5,7 +5,7 @@
 这份 README 同时是当前源码的**真实实现与接线说明**。阅读代码时请严格区分：
 
 - 一个类、接口、数据库表或测试文件存在，不等于它已经进入默认产品链路。
-- “支持 PostgreSQL/pgvector”不等于当前问答正在做向量检索。
+- 默认检索仍为 BM25；配置后 DashScope embedding、本地/PG 向量检索与 RRF 已接入。
 - “有记忆数据结构”不等于系统已经形成完整的长期用户理解。
 - 本文状态来自对启动入口、API、运行时和持久化调用链的静态核对，不根据历史计划推断。
 
@@ -17,7 +17,7 @@
 
 但以下四点必须特别注意：
 
-1. **默认书籍检索仍然是本地关键词/词面匹配，不是向量相似度。** PostgreSQL 中已经有 `vector(1024)` 字段和 HNSW 索引，但目前没有生成 embedding，也没有向量查询或混合排序代码接入问答。
+1. **默认书籍检索仍然是本地 BM25；embedding 混合检索是显式 opt-in。** 设置 `READING_AGENT_ENABLE_EMBEDDINGS=1` 并提供 `DASHSCOPE_API_KEY` 后，导入会生成 1024 维向量并以 RRF 混排；失败时继续 BM25。
 2. **语义意图识别和模型回答需要 `DASHSCOPE_API_KEY`。** 有密钥时使用轻量模型做意图与认知判断，再用回答模型生成内容；没有密钥时会退回确定性的关键词路由和本地提示文本。
 3. **PostgreSQL＋MinIO 是部分接线，不是完整运行时切换。** 书籍内容写入、进度、认证、Job 和 Answer 的若干持久化路径已经接入；但书籍、章节、对话等主要 API 仍以进程内对象为当前读取层，并用整体快照恢复。源码明确报告 `runtime_cutover=false`。
 4. **记忆系统已有可运行的基础链路，但还没有达到“真正理解用户”。** 最近对话、书籍讨论记忆、学习事件和认知状态的数据结构已经存在；当前自动写回主要只记录“用户明确没懂”的未确认事件，尚未完成稳定概念锚定、用户确认闭环和跨事件状态演化。
@@ -114,7 +114,7 @@ $env:READING_AGENT_INTENT_MODEL = "qwen3.7-flash"
 - 书籍问答会尽量定位原文，但不会生成完整的 AI 解释；
 - `/healthz` 中的 `model_available` 为 `false`。
 
-当前适配器名为 `QwenReaderModel`，请求格式使用 DashScope 的 OpenAI 兼容地址。它不是已经完成的通用模型供应商层，也没有正式接入 DeepSeek。即使模型接口格式相似，**回答模型和向量 embedding 是两件不同的事**；当前没有任何 embedding 模型调用。
+当前适配器名为 `QwenReaderModel`，请求格式使用 DashScope 的 OpenAI 兼容地址。回答模型和向量 embedding 分开配置；embedding 仅在显式开启后调用。
 
 ### 3. PostgreSQL＋MinIO 预览模式
 
@@ -210,10 +210,10 @@ Bucket:    reading-agent-stage05
 - 把查询与 Chunk 文本拆成英文单词、中文连续串和中文双字片段；
 - 按词面重叠计算分数；
 - 默认取前 3 个 Chunk；
-- 严格限制在当前用户和书籍版本内；当运行时已经绑定章节及可读进度时，再限制到对应章节和进度边界；
+- 严格限制在当前用户和书籍版本内；章节问题再限制到对应章节，当前暂不按阅读进度裁剪；
 - 为结果生成 EvidenceRef，并在回答前进行范围和内容摘要校验。
 
-导入时目前采用“一条 Block 对应一条 Chunk”的预览策略。`embedding_model` 字段虽然被写成 `local-lexical-preview-1`，它只是当前检索模式标记，**不是已经生成的向量模型名称**。
+导入时目前采用“一条 Block 对应一条 Chunk”的预览策略。默认使用 BM25；显式开启后 `embedding_model` 记录 DashScope embedding 模型名称。
 
 ### pgvector 的真实状态
 
@@ -224,15 +224,15 @@ PostgreSQL migration 已经包含：
 - 关键词 GIN 索引；
 - embedding 的 HNSW cosine 索引。
 
-但是运行时代码目前：
+配置 embedding 后，运行时代码：
 
-- 不调用 embedding 模型；
-- 写入 Chunk 时不填 `embedding`；
-- 没有 `ORDER BY embedding <=> query_vector` 一类向量查询；
-- 没有关键词与向量结果融合、重排或降级策略；
-- 即使启用 PostgreSQL＋MinIO，问答仍实例化 `LocalBookToolProvider`，继续做本地词面检索。
+- 批量调用 DashScope embedding 模型并校验 1024 维有限值；
+- 本地 sidecar 与 PostgreSQL `chunks.embedding` 均可保存向量；
+- PostgreSQL 使用 scoped cosine 查询，本地使用 cosine fallback；
+- BM25 与向量结果以固定 RRF 融合，异常时降级 BM25；
+- PostgreSQL＋MinIO 下问答仍以本地对象为读取层，PG runtime 仍是部分切换。
 
-因此当前状态是：**数据库承载结构已准备，向量检索主链路未实现和未接线。**
+因此当前状态是：**默认 BM25；配置后 DashScope embedding、本地/PG 向量检索与 RRF 已接线，PG runtime 仍部分切换。**
 
 ### 工具系统的真实状态
 
@@ -311,7 +311,7 @@ PostgreSQL migration 已经包含：
 - 导入后会根据标题、目录和部分正文判断书籍类型：有模型时优先语义分类；没有模型时使用关键词降级。
 - 对应阅读方法来自 `skills/reading/book_skills.v1.json`，会和用户偏好一起注入回答模型的 system context。
 - 用户可在设置中覆盖自动书籍分类，并调整回答风格、深度和 400 字以内的表达偏好。
-- 小说默认开启防剧透设置；章节范围内的检索会携带当前阅读边界。
+- 防剧透和检索阅读边界当前暂未接入；检索默认 BM25，配置后可使用向量混合检索。
 
 ### 当前限制
 
@@ -319,7 +319,7 @@ PostgreSQL migration 已经包含：
 - 没有创建多个 Skill、版本管理、导入导出、共享、组合、条件触发或安全审查。
 - 后端存在 teacher/friend/peer 角色字段，但当前网页没有暴露角色选择。
 - 内置 Skill 是本地静态目录，不会自行学习或进化。
-- 防剧透尚不是全书级硬保证：没有绑定章节时，当前“最佳章节”词面选择仍可能扫描全书 Chunk。
+- 防剧透尚未接入；全书检索暂不施加阅读进度边界。
 
 ## 持久化与数据来源
 
@@ -391,7 +391,7 @@ PostgreSQL migration 已经包含：
 
 ## 尚未实现或不要误判为已实现
 
-- embedding 生成、向量相似度查询和关键词＋向量混合检索；
+- 更完整的生产级 embedding/PG runtime 切换治理；
 - DeepSeek 正式模型适配器；
 - 联网搜索、网页读取和 MCP 工具接线；
 - 模型自主多步 Agent Loop；
@@ -435,7 +435,7 @@ PostgreSQL migration 已经包含：
 
 如果目标是尽快让产品“更懂书、更懂用户”，应先补主链路，不应继续只增加接口：
 
-1. **先接通真实检索**：选择 embedding 模型，导入时批量生成向量，写入 `chunks.embedding`，实现范围内向量查询，再与关键词结果融合；同时保留无 embedding 时的词面降级。
+1. **继续完善真实检索**：补充 embedding/PG runtime 的生产治理，同时保留无 embedding 时的 BM25 降级。
 2. **再闭合书籍学习记忆**：生成稳定概念锚点，把后续确认/纠正关联到旧 Episode，验证 Signal 后更新 ConceptState，让 Profile 真正有数据可用。
 3. **再完成 PostgreSQL 读取切换**：逐步让 Book、Chapter、Block、Answer History 和证据读取以规范化仓储为来源，移除整体快照的主运行时职责。
 4. **再拆独立 Worker**：上传请求只创建 Job；Worker 负责解析、分块、embedding、校验和发布，并能从 checkpoint 恢复。

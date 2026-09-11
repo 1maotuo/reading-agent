@@ -86,7 +86,11 @@ from .postgres_adapter import (
     PostgresJobStore,
     PostgresPublishTransaction,
 )
-from .retrieval import bm25_rank, merge_section_blocks
+from .retrieval import (
+    DashScopeEmbeddingClient, bm25_rank, cosine_rank, merge_section_blocks,
+    validate_embeddings,
+    reciprocal_rank_fusion,
+)
 from .storage_boundary import PersistenceBoundary
 from .worker import JobController
 
@@ -128,10 +132,12 @@ def _committed_job(job: JobRecord) -> JobRecord:
 class Stage05UploadHandler:
     """Synchronous local import adapter behind the existing job contract."""
 
-    def __init__(self, object_root: Path, *, object_store: MinioObjectStore | None = None) -> None:
+    def __init__(self, object_root: Path, *, object_store: MinioObjectStore | None = None,
+                 embedder: Any | None = None) -> None:
         self.object_root = object_root
         self.object_root.mkdir(parents=True, exist_ok=True)
         self.object_store = object_store
+        self.embedder = embedder if embedder is not None else DashScopeEmbeddingClient()
 
     def import_book(
         self,
@@ -284,6 +290,30 @@ class Stage05UploadHandler:
                 values={"embedded": False, "mode": DEVELOPMENT_RETRIEVAL},
             )
 
+            embeddings: dict[UUID, list[float]] = {}
+            if getattr(self.embedder, "enabled", False):
+                version_chunks = [item for item in services.books.chunks.values() if item.book_version_id == version_id]
+                try:
+                    vectors = self.embedder.embed([services.books.chunk_texts[item.chunk_id] for item in version_chunks])
+                    vectors = validate_embeddings(vectors, expected_count=len(version_chunks))
+                    embeddings = {item.chunk_id: vector for item, vector in zip(version_chunks, vectors)}
+                    for chunk_id, vector in embeddings.items():
+                        services.books.chunk_embeddings[chunk_id] = vector
+                        services.books.chunks[chunk_id] = services.books.chunks[chunk_id].model_copy(
+                            update={"embedding_model": getattr(self.embedder, "model", "qwen3.7-text-embedding")}
+                        )
+                    services.jobs.checkpoint(job.job_id, worker_id, stage=JobStage.EMBED,
+                                             values={"embedded": True, "count": len(embeddings), "mode": "qwen3.7-text-embedding"})
+                except Exception as exc:
+                    # A partial provider response is never attached to the book.
+                    embeddings.clear()
+                    services.books.chunk_embeddings = {
+                        key: value for key, value in services.books.chunk_embeddings.items()
+                        if key not in {item.chunk_id for item in version_chunks}
+                    }
+                    services.jobs.checkpoint(job.job_id, worker_id, stage=JobStage.EMBED,
+                                             values={"embedded": False, "degraded": True, "reason": type(exc).__name__, "mode": "bm25"})
+
             normalized_repository = getattr(
                 getattr(services, "storage_boundary", None), "book_repository", None
             )
@@ -322,6 +352,7 @@ class Stage05UploadHandler:
                         for item in services.books.chunks.values()
                         if item.book_version_id == version_id and item.chunk_id in services.books.chunk_texts
                     },
+                    embeddings=embeddings,
                     progress=[
                         item for item in services.books.progress.values()
                         if item.book_version_id == version_id
@@ -423,8 +454,9 @@ class Stage05UploadHandler:
 class LocalBookToolProvider:
     """Scope-bound deterministic retrieval used only for the Stage 05 preview."""
 
-    def __init__(self, services: ApiServices) -> None:
+    def __init__(self, services: ApiServices, embedder: Any | None = None) -> None:
         self.services = services
+        self.embedder = embedder
 
     def _chunks(self, scope: ScopeContext, chapter_ids: Iterable[UUID] | None = None) -> list[Chunk]:
         requested_chapters = set(chapter_ids) if chapter_ids is not None else None
@@ -437,7 +469,6 @@ class LocalBookToolProvider:
                 and chunk.book_version_id == scope.book_version_id
                 and (scope.chapter_id is None or chunk.chapter_id == scope.chapter_id)
                 and (requested_chapters is None or chunk.chapter_id in requested_chapters)
-                and (scope.furthest_chunk_index is None or chunk.chunk_index <= scope.furthest_chunk_index)
             ),
             key=lambda item: (item.chunk_index, str(item.chunk_id)),
         )
@@ -467,19 +498,55 @@ class LocalBookToolProvider:
             content_sha256=sha256_text(text),
             source_locator=first_block.source_locator,
         )
-        self.services.books.evidence[evidence.evidence_id] = evidence
-        return evidence
+        return self.store_evidence(scope, evidence)
+
+    def store_evidence(self, scope: ScopeContext, evidence: EvidenceRef) -> EvidenceRef:
+        """Persist canonical evidence through the configured oracle and mirror it locally."""
+
+        repository = getattr(getattr(self.services, "storage_boundary", None), "book_repository", None)
+        put_evidence = getattr(repository, "put_evidence", None)
+        canonical = put_evidence(scope, evidence) if callable(put_evidence) else evidence
+        self.services.books.evidence[canonical.evidence_id] = canonical
+        return canonical
 
     def call(self, name: ToolName, args: Any, scope: ScopeContext, call_id: UUID) -> ToolResult:
         if name is ToolName.SEARCH_BOOK and isinstance(args, SearchBookArgs):
-            ranked = bm25_rank(
+            chunks = self._chunks(scope, args.chapter_ids)
+            bm25 = bm25_rank(
                 args.query,
-                [
-                    (chunk, self.services.books.chunk_texts[chunk.chunk_id])
-                    for chunk in self._chunks(scope, args.chapter_ids)
-                ],
-                top_k=args.top_k,
+                [(chunk, self.services.books.chunk_texts[chunk.chunk_id]) for chunk in chunks],
+                top_k=4 * args.top_k,
             )
+            vector = []
+            if self.embedder is not None and getattr(self.embedder, "enabled", True):
+                try:
+                    query_vector = self.embedder.embed([args.query])[0]
+                    repository = getattr(getattr(self.services, "storage_boundary", None), "book_repository", None)
+                    pg_search = getattr(repository, "search_embeddings", None)
+                    if callable(pg_search):
+                        pg_hits = pg_search(scope, query_vector, top_k=4 * args.top_k, chapter_ids=args.chapter_ids)
+                        allowed = {chunk.chunk_id: chunk for chunk in chunks}
+                        vector = [(score, allowed[chunk_id]) for score, chunk_id in pg_hits if chunk_id in allowed]
+                    if not vector:
+                        vector = cosine_rank(
+                            query_vector,
+                            [(chunk, self.services.books.chunk_embeddings[chunk.chunk_id])
+                             for chunk in chunks if chunk.chunk_id in self.services.books.chunk_embeddings],
+                            top_k=4 * args.top_k,
+                        )
+                except Exception:
+                    # Provider, pgvector, malformed legacy vectors, and timeout
+                    # failures all degrade to local vectors and then BM25.
+                    try:
+                        vector = cosine_rank(
+                            query_vector,
+                            [(chunk, self.services.books.chunk_embeddings[chunk.chunk_id])
+                             for chunk in chunks if chunk.chunk_id in self.services.books.chunk_embeddings],
+                            top_k=4 * args.top_k,
+                        )
+                    except Exception:
+                        vector = []
+            ranked = reciprocal_rank_fusion(bm25, vector, top_k=args.top_k)
             if not ranked:
                 return ToolResult(
                     call_id=call_id,
@@ -488,7 +555,21 @@ class LocalBookToolProvider:
                     error=ToolError(code=ErrorCode.EVIDENCE_REQUIRED, message="当前范围内没有可用原文证据"),
                 )
             selected = [item for _, item in ranked]
+            selected_ids = {item.chunk_id for item in selected}
+            by_chapter: dict[UUID, list[Chunk]] = {}
+            for item in chunks:
+                by_chapter.setdefault(item.chapter_id, []).append(item)
+            for item in selected:
+                chapter_chunks = by_chapter.get(item.chapter_id, [])
+                position = next((index for index, candidate in enumerate(chapter_chunks)
+                                 if candidate.chunk_id == item.chunk_id), None)
+                if position is not None:
+                    selected_ids.update(candidate.chunk_id for candidate in chapter_chunks[max(0, position - 1):position + 2])
+            selected_with_context = [item for item in chunks if item.chunk_id in selected_ids]
             refs = [self._evidence_for(scope, chunk) for chunk in selected]
+            primary_ids = {ref.chunk_id for ref in refs}
+            neighbor_refs = [self._evidence_for(scope, chunk) for chunk in selected_with_context if chunk.chunk_id not in primary_ids]
+            refs.extend(neighbor_refs[: max(0, 20 - len(refs))])
             return ToolResult(
                 call_id=call_id,
                 name=name,
@@ -503,33 +584,43 @@ class LocalBookToolProvider:
                             score=max(0.0, ranked[index][0]),
                             source_locator=ref.source_locator,
                         )
-                        for index, ref in enumerate(refs)
+                        for index, ref in enumerate(refs[:len(selected)])
                     ]
                 ),
                 evidence_refs=refs,
             )
         if name is ToolName.READ_BOOK_BLOCKS and isinstance(args, ReadBookBlocksArgs):
-            blocks = [
+            requested = [
                 self.services.books.blocks[block_id]
                 for block_id in args.block_ids
                 if block_id in self.services.books.blocks
                 and self.services.books.blocks[block_id].user_id == scope.user_id
                 and self.services.books.blocks[block_id].book_id == scope.book_id
                 and self.services.books.blocks[block_id].book_version_id == scope.book_version_id
+                and (scope.chapter_id is None or self.services.books.blocks[block_id].chapter_id == scope.chapter_id)
             ]
-            if not blocks:
+            if not requested:
                 return ToolResult(
                     call_id=call_id,
                     name=name,
                     status=ToolCallStatus.FAILED,
                     error=ToolError(code=ErrorCode.EVIDENCE_REQUIRED, message="没有找到对应原文"),
                 )
+            blocks = list(requested)
+            for block in requested:
+                same = sorted((item for item in self.services.books.blocks.values()
+                               if item.chapter_id == block.chapter_id and item.user_id == scope.user_id
+                               and item.book_id == scope.book_id and item.book_version_id == scope.book_version_id),
+                              key=lambda item: item.ordinal)
+                pos = next(i for i, item in enumerate(same) if item.block_id == block.block_id)
+                blocks.extend(same[max(0, pos - args.context_before):pos])
+                blocks.extend(same[pos + 1:pos + 1 + args.context_after])
+            blocks = list({item.block_id: item for item in sorted(blocks, key=lambda item: (item.chapter_id, item.ordinal))}.values())
             refs_by_chunk: dict[UUID, EvidenceRef] = {}
             for block in blocks:
-                chunk = next(
-                    chunk for chunk in self.services.books.chunks.values()
-                    if block.block_id in chunk.block_ids
-                )
+                chunk = next((chunk for chunk in self._chunks(scope) if block.block_id in chunk.block_ids), None)
+                if chunk is None:
+                    continue
                 refs_by_chunk.setdefault(chunk.chunk_id, self._evidence_for(scope, chunk))
             refs = list(refs_by_chunk.values())
             return ToolResult(
@@ -581,6 +672,13 @@ class LocalBookToolProvider:
         )
 
     def read_evidence(self, scope: ScopeContext, evidence_id: UUID) -> EvidenceRef | None:
+        repository = getattr(getattr(self.services, "storage_boundary", None), "book_repository", None)
+        read_evidence = getattr(repository, "read_evidence", None)
+        if callable(read_evidence):
+            evidence = read_evidence(scope, evidence_id)
+            if evidence is not None:
+                self.services.books.evidence[evidence.evidence_id] = evidence
+            return evidence
         return self.services.books.read_evidence(scope, evidence_id)
 
 
@@ -990,9 +1088,11 @@ class ReaderAnswerHandler:
         intent: IntentFrame | None = None,
     ) -> ScopeContext:
         chapter_id: UUID | None = None
+        narrow_context = False
         if payload.selection_context is not None:
             chapter_id = payload.selection_context.chapter_id
-        if payload.highlight_id is not None:
+            narrow_context = True
+        if payload.highlight_id is not None and payload.selection_context is None:
             anchor = services.books.highlights.get(payload.highlight_id)
             if (
                 anchor is None
@@ -1002,6 +1102,7 @@ class ReaderAnswerHandler:
             ):
                 raise ContractViolation(ErrorCode.NOT_FOUND, "resource not found")
             chapter_id = anchor.chapter_id
+            narrow_context = True
         if payload.current_chapter_id is not None:
             current_chapter = services.books.authorized_chapter(
                 user_id=root_scope.user_id,
@@ -1014,9 +1115,16 @@ class ReaderAnswerHandler:
             if chapter_id is None:
                 chapter_id = current_chapter.chapter_id
         route = intent.route if intent is not None else DialogueRoute.BOOK_DIALOGUE
-        if chapter_id is None and route is DialogueRoute.BOOK_DIALOGUE:
+        explicit_passage = intent is not None and (
+            intent.scope.value == "passage"
+            or any(target.kind.value == "current_chapter" and target.explicit for target in intent.targets)
+        )
+        full_book = not explicit_passage and ((intent is not None and intent.scope.value in {"current_book", "mixed"}) or (
+            intent is not None and DialogueGoal.COMPARE in intent.goals
+        ))
+        if chapter_id is None and not full_book and route is DialogueRoute.BOOK_DIALOGUE:
             chapter_id = self.tools.best_chapter(root_scope, payload.question)
-        if chapter_id is None and route is DialogueRoute.BOOK_DIALOGUE:
+        if chapter_id is None and not full_book and route is DialogueRoute.BOOK_DIALOGUE:
             progress_rows = [
                 item
                 for item in services.books.progress.values()
@@ -1026,6 +1134,8 @@ class ReaderAnswerHandler:
             ]
             if progress_rows:
                 chapter_id = max(progress_rows, key=lambda item: item.updated_at).chapter_id
+        if full_book and not narrow_context:
+            return root_scope
         if chapter_id is None:
             return root_scope
         if (
@@ -1040,7 +1150,7 @@ class ReaderAnswerHandler:
             chapter_id=chapter_id,
             authorization=_BookAuthorization(services.books),
         )
-        return chapter_scope
+        return chapter_scope.model_copy(update={"furthest_chunk_index": None})
 
     @staticmethod
     def _generate_model(
@@ -1084,9 +1194,8 @@ class ReaderAnswerHandler:
         for start in range(0, len(text), size):
             yield text[start : start + size]
 
-    @staticmethod
     def _primary_evidence(
-        *, services: ApiServices, record: _AnswerRecord, payload: QuestionCreate
+        self, *, services: ApiServices, record: _AnswerRecord, payload: QuestionCreate
     ) -> EvidenceRef | None:
         block = None
         quote = ""
@@ -1122,8 +1231,7 @@ class ReaderAnswerHandler:
             content_sha256=sha256_text(quote),
             source_locator=block.source_locator,
         )
-        services.books.evidence[evidence.evidence_id] = evidence
-        return evidence
+        return self.tools.store_evidence(record.scope, evidence)
 
     def _emit_model(
         self,
@@ -1548,11 +1656,13 @@ def create_stage05_app(project_root: Path | None = None):
     if postgres_dsn and object_store is None:
         raise RuntimeError("PostgreSQL Stage 05 preview requires private MinIO configuration")
     services.object_store = object_store
+    embedder = DashScopeEmbeddingClient()
     services.upload_handler = Stage05UploadHandler(
         data_root / "var" / "dev-data" / "uploads",
         object_store=object_store,
+        embedder=embedder,
     )
-    tools = LocalBookToolProvider(services)
+    tools = LocalBookToolProvider(services, embedder=embedder)
     model = QwenReaderModel()
     services.answer_handler = ReaderAnswerHandler(services, tools, model)
     if postgres_dsn:
