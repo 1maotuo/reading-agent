@@ -100,6 +100,47 @@ def test_unknown_label_can_start_as_provisional_concept() -> None:
     assert concept.status is ConceptStatus.PROVISIONAL
 
 
+def test_runtime_concept_resolution_reuses_previous_anchor_and_adds_sources() -> None:
+    scope = _scope()
+    store = BookMemoryStore()
+    chapter_id, block_id = uuid4(), uuid4()
+    first = store.resolve_concept(
+        **scope,
+        label="因果关系",
+        source_chapter_ids=[chapter_id],
+        source_block_ids=[block_id],
+    )
+    assert first is not None
+    reused = store.resolve_concept(
+        **scope,
+        label=None,
+        preferred_concept_id=first.concept_id,
+        source_block_ids=[uuid4()],
+    )
+
+    assert reused is not None
+    assert reused.concept_id == first.concept_id
+    assert chapter_id in reused.source_chapter_ids
+    assert len(reused.source_block_ids) == 2
+
+
+def test_explicit_new_label_never_aliases_to_the_previous_concept() -> None:
+    scope = _scope()
+    store = BookMemoryStore()
+    previous = store.resolve_concept(**scope, label="决定论")
+    assert previous is not None
+
+    current = store.resolve_concept(
+        **scope,
+        label="自由意志",
+        preferred_concept_id=previous.concept_id,
+    )
+
+    assert current is not None
+    assert current.concept_id != previous.concept_id
+    assert store.match_concept(**scope, label="决定论") == previous
+
+
 def test_confirming_the_problem_does_not_upgrade_understanding() -> None:
     scope = _scope()
     store = BookMemoryStore()

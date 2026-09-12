@@ -573,6 +573,7 @@ class CognitiveFrame(StrictModel):
     """A bounded, evidence-backed hypothesis about the current learning need."""
 
     mode: CognitiveMode = CognitiveMode.NONE
+    topic_label: str | None = Field(default=None, max_length=120)
     learning_goal: LearningGoal = LearningGoal.UNKNOWN
     comprehension_state: ComprehensionState = ComprehensionState.UNKNOWN
     friction_type: FrictionType = FrictionType.UNKNOWN

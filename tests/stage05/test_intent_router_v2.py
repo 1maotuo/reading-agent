@@ -15,7 +15,7 @@ from reading_agent.contracts import (
     ResponseStrategy,
     TopicSource,
 )
-from reading_agent.dialogue import HybridIntentRouter
+from reading_agent.dialogue import HybridIntentRouter, compact_intent_context, teaching_guidance
 
 
 class SemanticPlanModel:
@@ -408,3 +408,19 @@ def test_v3_rejects_current_view_source_when_no_current_view_exists() -> None:
 
     assert intent.topic_source is TopicSource.NONE
     assert intent.topic_confidence == 0.0
+
+
+def test_degraded_learning_signal_builds_a_small_teaching_instruction() -> None:
+    intent = HybridIntentRouter().classify(
+        "我还是不懂作者为什么能从前提推出这个结论",
+        has_current_view=True,
+    )
+
+    assert intent.cognition.comprehension_state is ComprehensionState.CONFUSED
+    assert intent.cognition.friction_type is FrictionType.LOGIC
+    guidance = teaching_guidance(intent)
+    assert "前提、推理步骤、结论" in guidance
+    assert "先帮助，不立即考试" in guidance
+    compact = compact_intent_context(intent)
+    assert "context_needs" not in compact
+    assert "理解状态=confused" in compact

@@ -360,6 +360,74 @@ class BookMemoryStore:
                 return self._follow_merge(concept)
         return None
 
+    def resolve_concept(
+        self,
+        *,
+        user_id: UUID,
+        book_id: UUID,
+        book_version_id: UUID,
+        label: str | None,
+        preferred_concept_id: UUID | None = None,
+        source_chapter_ids: Iterable[UUID] = (),
+        source_block_ids: Iterable[UUID] = (),
+    ) -> BookConcept | None:
+        """Reuse a scoped concept or lazily create one from user-grounded text."""
+
+        concept: BookConcept | None = None
+        if preferred_concept_id is not None:
+            try:
+                concept = self._follow_merge(
+                    self._require_concept(
+                        preferred_concept_id, user_id, book_id, book_version_id
+                    )
+                )
+            except KeyError:
+                concept = None
+        clean_label = (label or "").strip()[:200]
+        if concept is not None and clean_label:
+            preferred_labels = {
+                _normalize_label(concept.canonical_name),
+                *(_normalize_label(item) for item in concept.aliases),
+            }
+            if _normalize_label(clean_label) not in preferred_labels:
+                concept = None
+        if concept is None and clean_label:
+            concept = self.match_concept(
+                user_id=user_id,
+                book_id=book_id,
+                book_version_id=book_version_id,
+                label=clean_label,
+            )
+        if concept is None and not clean_label:
+            return None
+        if concept is None:
+            concept = self.add_concept(
+                BookConcept(
+                    user_id=user_id,
+                    book_id=book_id,
+                    book_version_id=book_version_id,
+                    canonical_name=clean_label,
+                    source_chapter_ids=list(dict.fromkeys(source_chapter_ids))[:50],
+                    source_block_ids=list(dict.fromkeys(source_block_ids))[:100],
+                    status=ConceptStatus.PROVISIONAL,
+                    created_source=ConceptSource.RUNTIME,
+                )
+            )
+            return concept
+
+        updated = concept.model_copy(
+            update={
+                "source_chapter_ids": list(dict.fromkeys([
+                    *concept.source_chapter_ids, *source_chapter_ids
+                ]))[:50],
+                "source_block_ids": list(dict.fromkeys([
+                    *concept.source_block_ids, *source_block_ids
+                ]))[:100],
+            }
+        )
+        self.concepts[updated.concept_id] = updated
+        return updated
+
     def merge_concept(
         self,
         *,

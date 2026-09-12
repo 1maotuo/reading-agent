@@ -74,10 +74,10 @@ from .domain import (
     utc_now,
 )
 from .object_store import MinioObjectStore
-from .agent_core import ContextAssembler
+from .agent_core import ContextAssembler, context_budget_for
 from .memory_plan import MemoryPlanner, MemoryRetriever
 from .memory_writeback import BookMemoryWriter
-from .dialogue import recent_history
+from .dialogue import compact_intent_context, recent_history, teaching_guidance
 from .persistence import PostgresPreviewStateStore, SQLitePreviewStateStore
 from .postgres_adapter import (
     PostgresAnswerStore,
@@ -101,6 +101,83 @@ DEVELOPMENT_RETRIEVAL = "local-bm25-preview-1"
 DEVELOPMENT_CHUNKER = "section-structure-chunker-v1"
 DEMO_IDENTIFIER = os.environ.get("READING_AGENT_PREVIEW_EMAIL", "reader@example.local")
 DEMO_PASSWORD = os.environ.get("READING_AGENT_PREVIEW_PASSWORD", "reading-demo")
+
+
+_ANSWER_CITATION = re.compile(r"\[E(\d+)\]")
+_INCOMPLETE_CITATION = re.compile(r"\[(?:E\d*)?$")
+
+
+class _CitationStreamGuard:
+    """Hold split citation tokens and remove invalid ones before SSE emission."""
+
+    def __init__(self, evidence_count: int) -> None:
+        self.evidence_count = evidence_count
+        self.pending = ""
+        self.invalid_count = 0
+
+    def _replace(self, match: re.Match[str]) -> str:
+        index = int(match.group(1))
+        if 1 <= index <= self.evidence_count:
+            return match.group(0)
+        self.invalid_count += 1
+        return ""
+
+    def feed(self, delta: str) -> str:
+        value = f"{self.pending}{delta}"
+        self.pending = ""
+        incomplete = _INCOMPLETE_CITATION.search(value)
+        if incomplete is not None:
+            self.pending = value[incomplete.start():]
+            value = value[:incomplete.start()]
+        return _ANSWER_CITATION.sub(self._replace, value)
+
+    def finish(self) -> str:
+        value, self.pending = self.pending, ""
+        if value.startswith("[E"):
+            self.invalid_count += 1
+            return ""
+        return _ANSWER_CITATION.sub(self._replace, value)
+
+
+def prepare_answer_for_publish(
+    answer: str,
+    evidence: Iterable[EvidenceRef],
+) -> tuple[str, dict[str, int | bool]]:
+    """Repair citation shape without a second model call."""
+
+    refs = list(evidence)
+    text = answer.strip()
+    if not text:
+        if refs:
+            text = f"我没有生成出可靠解释。先看最相关的原文：\n\n“{refs[0].quote}” [E1]"
+        else:
+            text = "我暂时没有生成出可靠回答，请再说一次你想讨论的问题。"
+    invalid = 0
+
+    def keep_valid(match: re.Match[str]) -> str:
+        nonlocal invalid
+        index = int(match.group(1))
+        if 1 <= index <= len(refs):
+            return match.group(0)
+        invalid += 1
+        return ""
+
+    text = _ANSWER_CITATION.sub(keep_valid, text).rstrip()
+    valid_count = sum(
+        1 for match in _ANSWER_CITATION.finditer(text)
+        if 1 <= int(match.group(1)) <= len(refs)
+    )
+    appended = False
+    if refs and valid_count == 0:
+        text = f"{text}\n\n依据原文：[E1]"
+        valid_count = 1
+        appended = True
+    return text, {
+        "evidence_count": len(refs),
+        "valid_citations": valid_count,
+        "invalid_citations_removed": invalid,
+        "citation_appended": appended,
+    }
 
 
 def _source_locator(locator: Any) -> SourceLocator:
@@ -750,6 +827,7 @@ class QwenReaderModel:
                         "topic_source只能是explicit、previous_turn、current_view、ambiguous、none；只能从"
                         "routing_context.topic_candidates中选择话题来源，不能编造来源。topic_confidence为0到1。"
                         "仅当route为book_dialogue时填写cognition；mode只能是none、conversation、learning；"
+                        "topic_label只提取当前问题或近期用户话语中明确出现的核心概念短语，不能猜测，无法确定时为null；"
                         "learning_goal只能是understand、verify、deepen、critique、apply、recall、unknown；"
                         "comprehension_state只能是unknown、confused、partial、likely_clear；friction_type只能是"
                         "unknown、term、background、logic、example、evidence、translation、contradiction。"
@@ -821,10 +899,11 @@ class QwenReaderModel:
                             ]},
                             "topic_confidence": {"type": "number", "minimum": 0, "maximum": 1},
                             "cognition": {"type": "object", "additionalProperties": False, "required": [
-                                "mode", "learning_goal", "comprehension_state", "friction_type",
+                                "mode", "topic_label", "learning_goal", "comprehension_state", "friction_type",
                                 "evidence_quotes", "confidence"
                             ], "properties": {
                                 "mode": {"type": "string", "enum": ["none", "conversation", "learning"]},
+                                "topic_label": {"type": ["string", "null"], "maxLength": 120},
                                 "learning_goal": {"type": "string", "enum": [
                                     "understand", "verify", "deepen", "critique", "apply", "recall", "unknown"
                                 ]},
@@ -944,7 +1023,7 @@ class QwenReaderModel:
         history_text = "\n\n".join(
             f"用户：{item['question']}\n页伴：{item['answer']}" for item in history
         )
-        intent_text = intent.model_dump_json() if intent is not None else "{}"
+        intent_text = compact_intent_context(intent) if intent is not None else "未提供"
         context = f"\n\n<history_data>\n{history_text}\n</history_data>" if history_text else ""
         evidence_context = f"\n\n<evidence_data>\n{evidence_text}\n</evidence_data>" if evidence_text else ""
         return {
@@ -1071,7 +1150,6 @@ class ReaderAnswerHandler:
         self.services = services
         self.tools = tools
         self.model = model
-        self.context_assembler = ContextAssembler()
 
     def cancel(self, record: _AnswerRecord) -> None:
         record.cancel_requested = True
@@ -1243,13 +1321,15 @@ class ReaderAnswerHandler:
         intent: IntentFrame,
         skill_context: str,
     ) -> tuple[str, dict[str, int], str]:
+        evidence_values = tuple(evidence)
         stream = getattr(self.model, "generate_stream", None)
         if callable(stream):
             parts: list[str] = []
             usage: dict[str, int] = {}
+            citation_guard = _CitationStreamGuard(len(evidence_values))
             stream_kwargs: dict[str, Any] = {
                 "question": question,
-                "evidence": evidence,
+                "evidence": evidence_values,
                 "history": history,
                 "intent": intent,
                 "skill_context": skill_context,
@@ -1275,9 +1355,17 @@ class ReaderAnswerHandler:
                 if final_usage is not None:
                     usage = final_usage
                 if delta:
-                    parts.append(delta)
-                    record.answer_text = "".join(parts)
-                    record.ledger.answer_delta(delta)
+                    safe_delta = citation_guard.feed(delta)
+                    if safe_delta:
+                        parts.append(safe_delta)
+                        record.answer_text = "".join(parts)
+                        record.ledger.answer_delta(safe_delta)
+            tail = citation_guard.finish()
+            if tail:
+                parts.append(tail)
+                record.answer_text = "".join(parts)
+                record.ledger.answer_delta(tail)
+            record.trace_details["stream_invalid_citations_removed"] = citation_guard.invalid_count
             if record.cancel_requested:
                 record.answer_text = "".join(parts)
                 if record.ledger.terminal is None:
@@ -1289,11 +1377,13 @@ class ReaderAnswerHandler:
         answer, usage = self._generate_model(
             self.model,
             question=question,
-            evidence=evidence,
+            evidence=evidence_values,
             history=history,
             intent=intent,
             skill_context=skill_context,
         )
+        answer, validation = prepare_answer_for_publish(answer, evidence_values)
+        record.trace_details["prestream_publish_validation"] = validation
         for delta in self._answer_chunks(answer):
             if record.cancel_requested:
                 record.ledger.cancel()
@@ -1340,21 +1430,47 @@ class ReaderAnswerHandler:
                 key=lambda item: item.created_at,
             )
             history = recent_history(conversation_records, limit=4)
-            skill_context = services.companion.system_context(
-                user_id=record.scope.user_id,
-                book_id=record.scope.book_id,
-            )
             companion = services.companion.view(
                 user_id=record.scope.user_id,
                 book_id=record.scope.book_id,
             )
             record.trace_details["skill_version"] = companion.skill_version
+            previous_concept_id: UUID | None = None
+            if conversation_records and (
+                intent.topic_source.value == "previous_turn"
+                or intent.relation in {
+                    DialogueRelation.FOLLOWUP,
+                    DialogueRelation.CONFUSED,
+                    DialogueRelation.CORRECTION,
+                }
+            ):
+                raw_concept_id = conversation_records[-1].trace_details.get("concept_id")
+                try:
+                    previous_concept_id = UUID(str(raw_concept_id)) if raw_concept_id else None
+                except ValueError:
+                    previous_concept_id = None
+            if previous_concept_id is not None and intent.cognition.topic_label:
+                matched_current = services.book_memory.match_concept(
+                    user_id=record.scope.user_id,
+                    book_id=record.scope.book_id,
+                    book_version_id=record.scope.book_version_id,
+                    label=intent.cognition.topic_label,
+                )
+                if matched_current is None or matched_current.concept_id != previous_concept_id:
+                    previous_concept_id = None
+            retrieval_query = payload.question
+            if previous_concept_id is not None:
+                previous_concept = services.book_memory.concepts.get(previous_concept_id)
+                if previous_concept is not None:
+                    retrieval_query = f"{previous_concept.canonical_name} {payload.question}"
+            record.trace_details["retrieval_query_rewritten"] = retrieval_query != payload.question
             memory_plan = MemoryPlanner.build(
                 intent=intent,
                 user_id=record.scope.user_id,
                 book_id=record.scope.book_id,
                 book_version_id=record.scope.book_version_id,
-                query=payload.question,
+                query=retrieval_query,
+                concept_id=previous_concept_id,
             )
             book_memory_bundle = (
                 MemoryRetriever(services.book_memory).retrieve(memory_plan)
@@ -1371,7 +1487,7 @@ class ReaderAnswerHandler:
                 for item in (book_memory_bundle.hits if book_memory_bundle is not None else [])
             ]
             memory_hits = []
-            if companion.user_skill.long_term_memory_enabled:
+            if companion.user_skill.long_term_memory_enabled and not book_memory_context:
                 memory_hits = services.memory.search(
                     user_id=record.scope.user_id,
                     book_id=record.scope.book_id,
@@ -1387,6 +1503,19 @@ class ReaderAnswerHandler:
                         {"question": "[长期记忆；仅作对话背景，不是事实证据]", "answer": memory_text},
                         *history,
                     ]
+            guidance = teaching_guidance(
+                intent,
+                has_prior_learning_state=bool(book_memory_context),
+            )
+            skill_context = services.companion.system_context(
+                user_id=record.scope.user_id,
+                book_id=record.scope.book_id,
+                teaching_guidance=guidance,
+            )
+            assembler = ContextAssembler(
+                context_budget_for(intent, depth=companion.user_skill.depth)
+            )
+            record.trace_details["teaching_guidance"] = guidance
             record.trace_details["memory_hits"] = len(memory_hits)
             record.trace_details["book_memory_hits"] = len(book_memory_context)
             record.trace_details["book_memory_enabled"] = companion.user_skill.long_term_memory_enabled
@@ -1397,7 +1526,7 @@ class ReaderAnswerHandler:
                 "include_unconfirmed": memory_plan.include_unconfirmed,
             }
             if intent.route is not DialogueRoute.BOOK_DIALOGUE:
-                package = self.context_assembler.build(
+                package = assembler.build(
                     question=payload.question,
                     skill_context=skill_context,
                     history=history,
@@ -1466,7 +1595,7 @@ class ReaderAnswerHandler:
                 result = dispatch_tool(
                     scope=record.scope,
                     name=ToolName.SEARCH_BOOK,
-                    args={"query": payload.question, "top_k": 3},
+                    args={"query": retrieval_query, "top_k": 3},
                     call_id=search_id,
                     provider=self.tools,
                     evidence_reader=self.tools.read_evidence,
@@ -1496,7 +1625,7 @@ class ReaderAnswerHandler:
             )
             record.ledger.evidence(proof)
             record.evidence_ids = [item.evidence_id for item in bundle.refs]
-            package = self.context_assembler.build(
+            package = assembler.build(
                 question=payload.question,
                 skill_context=skill_context,
                 history=history,
@@ -1533,6 +1662,17 @@ class ReaderAnswerHandler:
                 for delta in self._answer_chunks(answer):
                     record.ledger.answer_delta(delta)
                 record.answer_text = answer
+            published_answer, publish_validation = prepare_answer_for_publish(
+                record.answer_text,
+                bundle.refs,
+            )
+            publish_validation["invalid_citations_removed"] = int(
+                publish_validation["invalid_citations_removed"]
+            ) + int(record.trace_details.pop("stream_invalid_citations_removed", 0))
+            if published_answer != record.answer_text and published_answer.startswith(record.answer_text):
+                record.ledger.answer_delta(published_answer[len(record.answer_text):])
+            record.answer_text = published_answer
+            record.trace_details["publish_validation"] = publish_validation
             record.trace_details["stream_mode"] = stream_mode
             record.ledger.phase("saving", "正在保存本轮")
             record.ledger.complete(
@@ -1541,14 +1681,7 @@ class ReaderAnswerHandler:
                 evidence_ids=record.evidence_ids,
                 usage=usage,
             )
-            if companion.user_skill.long_term_memory_enabled:
-                services.memory.remember_discussion(
-                    user_id=record.scope.user_id,
-                    book_id=record.scope.book_id,
-                    source_run_id=record.ledger.run_id,
-                    question=payload.question,
-                    answer=record.answer_text,
-                )
+            writeback = None
             try:
                 writeback = BookMemoryWriter(services.book_memory).record_completed_turn(
                     intent=intent,
@@ -1559,17 +1692,41 @@ class ReaderAnswerHandler:
                     answer_run_id=record.ledger.run_id,
                     question=payload.question,
                     evidence_ref_ids=record.evidence_ids,
+                    concept_label=intent.cognition.topic_label,
+                    previous_concept_id=previous_concept_id,
+                    source_chapter_ids=list(dict.fromkeys(
+                        item.chapter_id for item in bundle.refs
+                    )),
+                    source_block_ids=list(dict.fromkeys(
+                        block_id for item in bundle.refs for block_id in item.block_ids
+                    )),
+                    evidence_excerpt=bundle.refs[0].quote if bundle.refs else None,
                     memory_enabled=companion.user_skill.long_term_memory_enabled,
                 )
                 record.trace_details["book_memory_writeback"] = {
                     "committed": writeback.committed,
                     "reason": writeback.reason.value,
                 }
+                if writeback.concept_id is not None:
+                    record.trace_details["concept_id"] = str(writeback.concept_id)
+                if writeback.episode_id is not None:
+                    record.trace_details["learning_episode_id"] = str(writeback.episode_id)
             except Exception:  # memory writeback must not turn a completed answer into a failure
                 record.trace_details["book_memory_writeback"] = {
                     "committed": False,
                     "reason": "writeback_failed",
                 }
+            if (
+                companion.user_skill.long_term_memory_enabled
+                and (writeback is None or not writeback.committed)
+            ):
+                services.memory.remember_discussion(
+                    user_id=record.scope.user_id,
+                    book_id=record.scope.book_id,
+                    source_run_id=record.ledger.run_id,
+                    question=payload.question,
+                    answer=record.answer_text,
+                )
             record.finished_at = utc_now()
         except ContractViolation as exc:
             if active_tool is not None:

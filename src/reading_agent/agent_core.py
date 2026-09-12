@@ -6,10 +6,32 @@ import hashlib
 from dataclasses import dataclass
 from typing import Iterable
 
-from .contracts import EvidenceRef
+from .contracts import DialogueGoal, DialogueRoute, EvidenceRef, IntentFrame, ResponseStrategy
 
 
 MemoryContextItem = dict[str, str | int | bool]
+
+
+def context_budget_for(intent: IntentFrame, *, depth: str = "balanced") -> int:
+    """Choose a small deterministic budget from the actual teaching task."""
+
+    if intent.route is not DialogueRoute.BOOK_DIALOGUE:
+        base = 1600
+    elif (
+        intent.response_strategy in {ResponseStrategy.CRITIQUE, ResponseStrategy.RECONSTRUCT}
+        or any(goal in intent.goals for goal in {
+            DialogueGoal.COMPARE, DialogueGoal.CRITIQUE, DialogueGoal.ANALYZE_ARGUMENT
+        })
+    ):
+        base = 5200
+    elif intent.response_strategy is ResponseStrategy.VERIFY:
+        base = 2800
+    elif intent.scope.value == "passage":
+        base = 3000
+    else:
+        base = 3800
+    adjustment = {"quick": -500, "balanced": 0, "deep": 700}.get(depth, 0)
+    return max(1200, min(6500, base + adjustment))
 
 
 def estimate_tokens(text: str) -> int:

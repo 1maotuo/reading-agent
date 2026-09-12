@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from uuid import UUID, uuid4
 
-from reading_agent.book_memory import BookMemoryStore, SignalValidation
+from reading_agent.book_memory import (
+    BookMemoryStore,
+    LearningDimension,
+    SignalValidation,
+    UnderstandingState,
+)
 from reading_agent.contracts import (
     CognitiveFrame,
     CognitiveMode,
@@ -105,6 +110,8 @@ def test_confusion_writes_candidate_and_is_idempotent() -> None:
     assert len(store.signals) == 1
     signal = next(iter(store.signals.values()))
     assert signal.validation_status is SignalValidation.CANDIDATE
+    assert signal.concept_id == first.concept_id
+    assert first.concept_id in store.concepts
     assert store.states == {}
 
 
@@ -122,3 +129,85 @@ def test_disabled_memory_does_not_write() -> None:
     assert result.committed is False
     assert result.reason is WritebackReason.MEMORY_DISABLED
     assert store.episodes == {}
+
+
+def test_followup_clear_signal_confirms_problem_and_updates_concept_state() -> None:
+    store = BookMemoryStore()
+    scope = _scope()
+    writer = BookMemoryWriter(store)
+    confused = writer.record_completed_turn(
+        intent=_intent(ComprehensionState.CONFUSED),
+        **scope,
+        conversation_id=uuid4(),
+        answer_run_id=uuid4(),
+        question="我还是不明白作者为什么能从前提推出结论",
+    )
+    assert confused.concept_id is not None
+    clear_intent = _intent(ComprehensionState.PARTIAL).model_copy(update={
+        "cognition": _intent(ComprehensionState.PARTIAL).cognition.model_copy(update={
+            "evidence_quotes": ["我大概懂了"],
+            "confidence": 0.85,
+        })
+    })
+    progress = writer.record_completed_turn(
+        intent=clear_intent,
+        **scope,
+        conversation_id=uuid4(),
+        answer_run_id=uuid4(),
+        question="我大概懂了",
+        previous_concept_id=confused.concept_id,
+    )
+
+    assert progress.committed is True
+    assert progress.reason is WritebackReason.RECORDED_PROGRESS
+    assert store.get_state(
+        **scope,
+        concept_id=confused.concept_id,
+        dimension=LearningDimension.ARGUMENT,
+    ).state is UnderstandingState.PARTIAL
+
+
+def test_followup_without_a_new_friction_keeps_the_previous_learning_dimension() -> None:
+    store = BookMemoryStore()
+    scope = _scope()
+    writer = BookMemoryWriter(store)
+    term_intent = _intent(ComprehensionState.CONFUSED).model_copy(update={
+        "cognition": _intent(ComprehensionState.CONFUSED).cognition.model_copy(update={
+            "friction_type": FrictionType.TERM,
+            "evidence_quotes": ["我不懂这个词"],
+        })
+    })
+    confused = writer.record_completed_turn(
+        intent=term_intent,
+        **scope,
+        conversation_id=uuid4(),
+        answer_run_id=uuid4(),
+        question="我不懂这个词",
+        concept_label="作者术语",
+    )
+    assert confused.concept_id is not None
+    clear_intent = _intent(ComprehensionState.PARTIAL).model_copy(update={
+        "cognition": _intent(ComprehensionState.PARTIAL).cognition.model_copy(update={
+            "friction_type": FrictionType.UNKNOWN,
+            "evidence_quotes": ["我大概懂了"],
+        })
+    })
+    writer.record_completed_turn(
+        intent=clear_intent,
+        **scope,
+        conversation_id=uuid4(),
+        answer_run_id=uuid4(),
+        question="我大概懂了",
+        previous_concept_id=confused.concept_id,
+    )
+
+    assert store.get_state(
+        **scope,
+        concept_id=confused.concept_id,
+        dimension=LearningDimension.MEANING,
+    ).state is UnderstandingState.PARTIAL
+    assert store.get_state(
+        **scope,
+        concept_id=confused.concept_id,
+        dimension=LearningDimension.ARGUMENT,
+    ).state is UnderstandingState.UNKNOWN

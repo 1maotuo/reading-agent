@@ -72,7 +72,9 @@ _OPEN_TERMS = (
     "我很开心",
     "我有点难过",
 )
-_CONFUSION_TERMS = ("什么意思", "没懂", "不懂", "不明白", "看不懂", "怎么理解", "为什么")
+_CONFUSION_TERMS = ("什么意思", "没懂", "不懂", "不明白", "看不懂", "怎么理解", "为什么", "卡住")
+_CLEAR_TERMS = ("明白了", "懂了", "清楚了", "大概懂", "好像懂", "我理解")
+_RESTATE_TERMS = ("我试着复述", "换句话说", "也就是说", "我的理解", "是不是可以理解为")
 _BOOK_TERMS = (
     "这本书",
     "本书",
@@ -99,7 +101,10 @@ _BOOK_TERMS = (
     "对比",
 )
 _CORRECTION_TERMS = ("不对", "不是这个意思", "我觉得不是", "你说错", "纠正一下", "应该是")
-_FOLLOWUP_TERMS = ("为什么", "然后呢", "再说说", "举个例子", "具体一点", "什么意思", "怎么理解", "那")
+_FOLLOWUP_TERMS = (
+    "为什么", "然后呢", "再说说", "举个例子", "具体一点", "什么意思", "怎么理解", "那",
+    "换个说法", "继续深入", "我试着复述", "还是不懂", "还是没懂",
+)
 _LIGHT_OPEN_FOLLOWUPS = {"为什么", "然后呢", "再说说", "还有呢", "继续", "真的吗", "怎么了"}
 _BOUND_BOOK_REFERENTS = ("这本书", "本书", "这一章", "本章", "书中", "书里")
 _DEICTIC_TERMS = ("这个", "这段", "它", "刚才", "上面", "这里")
@@ -144,6 +149,108 @@ def _goals(value: str) -> list[DialogueGoal]:
         if _contains_any(value, terms):
             goals.append(goal)
     return goals or [DialogueGoal.EXPLAIN]
+
+
+def _topic_label(value: str) -> str | None:
+    """Extract a conservative user-owned label for degraded routing."""
+
+    quoted = re.search(r"[“「『\"]([^”」』\"]{2,80})[”」』\"]", value)
+    if quoted:
+        return quoted.group(1).strip()
+    candidate = value
+    for term in (
+        *_CONFUSION_TERMS,
+        *_CLEAR_TERMS,
+        *_RESTATE_TERMS,
+        "作者", "这本书", "本书", "这一章", "这章", "原文", "这个", "这段",
+        "请", "能不能", "可以", "帮我", "一下", "吗", "呢",
+    ):
+        candidate = candidate.replace(term, "")
+    candidate = re.sub(r"[？?！!。,.，、：:；;\s]+", "", candidate).strip()
+    return candidate[:80] if 2 <= len(candidate) <= 80 else None
+
+
+def _fallback_cognition(question: str, route: DialogueRoute) -> CognitiveFrame:
+    """Keep explicit learning signals useful when the semantic model is down."""
+
+    if route is not DialogueRoute.BOOK_DIALOGUE:
+        return CognitiveFrame(
+            mode=CognitiveMode.CONVERSATION if route is DialogueRoute.OPEN_DIALOGUE else CognitiveMode.NONE
+        )
+    value = _compact(question)
+    if _contains_any(value, _CONFUSION_TERMS):
+        state = ComprehensionState.CONFUSED
+        confidence = 0.72
+    elif _contains_any(value, _CLEAR_TERMS + _RESTATE_TERMS):
+        state = ComprehensionState.PARTIAL
+        confidence = 0.66
+    else:
+        state = ComprehensionState.UNKNOWN
+        confidence = 0.0
+    if _contains_any(value, ("术语", "词", "什么意思", "定义")):
+        friction = FrictionType.TERM
+    elif _contains_any(value, ("例子", "举例", "应用", "实际")):
+        friction = FrictionType.EXAMPLE
+    elif _contains_any(value, ("证据", "依据", "证明")):
+        friction = FrictionType.EVIDENCE
+    elif _contains_any(value, ("矛盾", "冲突", "不对")):
+        friction = FrictionType.CONTRADICTION
+    elif _contains_any(value, ("为什么", "推理", "论证", "前提", "结论")):
+        friction = FrictionType.LOGIC
+    else:
+        friction = FrictionType.UNKNOWN
+    goal = (
+        LearningGoal.VERIFY
+        if _contains_any(value, _CLEAR_TERMS + _RESTATE_TERMS)
+        else LearningGoal.UNDERSTAND
+    )
+    return CognitiveFrame(
+        mode=CognitiveMode.LEARNING,
+        topic_label=_topic_label(question),
+        learning_goal=goal,
+        comprehension_state=state,
+        friction_type=friction,
+        evidence_quotes=[question.strip()[:160]] if state is not ComprehensionState.UNKNOWN else [],
+        confidence=confidence,
+    )
+
+
+def compact_intent_context(intent: IntentFrame) -> str:
+    """Return only answer-shaping intent data, not the full routing contract."""
+
+    cognition = intent.cognition
+    return (
+        f"任务={','.join(item.value for item in intent.tasks) or 'discuss'}；"
+        f"关系={intent.relation.value}；策略={intent.response_strategy.value}；"
+        f"学习目标={cognition.learning_goal.value}；理解状态={cognition.comprehension_state.value}；"
+        f"卡点={cognition.friction_type.value}；话题={cognition.topic_label or '未明确'}"
+    )
+
+
+def teaching_guidance(intent: IntentFrame, *, has_prior_learning_state: bool = False) -> str:
+    """Translate cognition into one compact teaching move for the answer model."""
+
+    if intent.route is not DialogueRoute.BOOK_DIALOGUE:
+        return ""
+    cognition = intent.cognition
+    moves = {
+        FrictionType.TERM: "先说明这个词在作者语境中的含义，再用一句通俗话和一个短例子解释。",
+        FrictionType.TRANSLATION: "先还原原句含义，再解释译法差异，不把换词当成解释。",
+        FrictionType.BACKGROUND: "只补理解当前原文所需的最少背景，并标明哪些不是书中原话。",
+        FrictionType.LOGIC: "按前提、推理步骤、结论重建论证，明确指出用户卡住的连接。",
+        FrictionType.EXAMPLE: "先给一个贴近生活的例子，再逐点映射回原文概念，并说明类比边界。",
+        FrictionType.EVIDENCE: "区分作者结论、支持证据和仍然不能确定的部分。",
+        FrictionType.CONTRADICTION: "把看似冲突的两点并列，检查语境、层级和隐含前提。",
+        FrictionType.UNKNOWN: "先直接回应，再用最短路径解释关键概念与原文关系。",
+    }
+    state_moves = {
+        ComprehensionState.CONFUSED: "用户明确卡住：先帮助，不立即考试；避免重复术语堆砌。",
+        ComprehensionState.PARTIAL: "用户已有部分理解：保留正确部分，只补缺口，最后最多问一个轻量确认问题。",
+        ComprehensionState.LIKELY_CLEAR: "用户可能已经理解：简短核对其复述，不直接宣称已经掌握。",
+        ComprehensionState.UNKNOWN: "不要猜用户懂不懂；回答后只在确有必要时提出一个澄清问题。",
+    }
+    prior = "参考已召回的学习状态，避免从头重复讲解。" if has_prior_learning_state else ""
+    return f"{moves[cognition.friction_type]}{state_moves[cognition.comprehension_state]}{prior}"
 
 
 _GOAL_TASK = {
@@ -277,6 +384,11 @@ def _valid_cognitive(
         quote = item.strip()[:160]
         if quote and any(quote in source for source in allowed):
             quotes.append(quote)
+    topic_label = str(raw.get("topic_label") or "").strip()[:120] or None
+    if topic_label is not None:
+        compact_label = _compact(topic_label)
+        if not compact_label or not any(compact_label in _compact(source) for source in allowed):
+            topic_label = None
     # No verifiable user wording means we do not label their comprehension.
     if not quotes and (state is not ComprehensionState.UNKNOWN or friction is not FrictionType.UNKNOWN):
         state = ComprehensionState.UNKNOWN
@@ -284,6 +396,7 @@ def _valid_cognitive(
         confidence = min(confidence, 0.4)
     return CognitiveFrame(
         mode=CognitiveMode.LEARNING,
+        topic_label=topic_label,
         learning_goal=goal,
         comprehension_state=state,
         friction_type=friction,
@@ -449,6 +562,7 @@ class IntentRouter:
                 if has_current_view and _contains_any(value, _DEICTIC_TERMS)
                 else 0.0
             ),
+            cognition=_fallback_cognition(question, route),
         )
 
 
@@ -731,6 +845,7 @@ class HybridIntentRouter:
             resolved_by="degraded_fallback",
             topic_source=TopicSource.PREVIOUS_TURN if is_previous_reference else TopicSource.NONE,
             topic_confidence=0.82 if is_previous_reference else 0.0,
+            cognition=_fallback_cognition(question, result.route),
         )
         return fallback.model_copy(
             update={
