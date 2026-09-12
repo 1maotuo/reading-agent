@@ -177,6 +177,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .citations { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 6px; }
 .citations button { padding: 6px 9px; border: 1px solid #d8d0c2; border-radius: 4px; display: flex; align-items: center; gap: 5px; color: #795948; background: #fbf8f1; font-size: 9px; cursor: pointer; }
 .citations svg { width: 11px; height: 11px; }
+.learning-actions { margin-top: 11px; display: flex; flex-wrap: wrap; gap: 6px; }
+.learning-actions button { padding: 5px 9px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); background: rgba(255,255,255,.62); font-size: 9px; cursor: pointer; }
+.learning-actions button:hover { color: var(--accent); border-color: #d9c2ad; background: #fbf5ed; }
 .thinking-row { display: flex; align-items: center; gap: 5px; margin: 7px 0 15px; color: var(--muted); font-size: 10px; }
 .thinking-row button { margin-left: auto; padding: 4px 8px; border: 1px solid var(--line); border-radius: 999px; display: inline-flex; align-items: center; gap: 4px; color: var(--muted); background: transparent; font-size: 9px; cursor: pointer; }
 .thinking-row button svg { width: 11px; height: 11px; }
