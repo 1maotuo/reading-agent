@@ -9,7 +9,26 @@
 - “有记忆数据结构”不等于系统已经形成完整的长期用户理解。
 - 本文状态来自对启动入口、API、运行时和持久化调用链的静态核对，不根据历史计划推断。
 
-当前源码快照日期：2026-09-11。
+当前源码快照日期：2026-09-12。
+
+## 产品原则
+
+页伴目前的技术设计围绕三个简单原则展开：
+
+1. **书籍证据负责回答“书里到底说了什么”。** 书籍原文、页码、章节和引用必须能够从服务端重新读回并验证。
+2. **用户记忆负责回答“这次应该怎样给这个用户讲”。** 记忆可以影响教学方式，但不能冒充书籍事实或原文证据。
+3. **服务端掌握范围、工具和发布边界。** 模型可以帮助理解语义和组织语言，但不能自行指定用户、书籍、版本，也不能绕过工具参数和证据校验。
+
+这三个原则决定了当前架构不是一个无限循环、自由调用工具的通用 Agent，而是一个固定、可观察、可降级的 Reading Agent Loop。
+
+## 文档导航
+
+- 想先运行项目：看“Windows 快速启动”；
+- 想理解整体架构：看“当前默认运行链路”和“一条用户消息的完整生命周期”；
+- 想理解 RAG：看“书籍检索与证据”；
+- 想理解用户记忆：看“记忆系统的真实状态”；
+- 想知道失败后会怎样：看“回答失败、取消、重连与恢复”；
+- 想接着开发：看“代码地图”和“后续开发的合理接线顺序”。
 
 ## 一分钟结论
 
@@ -48,7 +67,7 @@ HybridIntentRouter
   ↓
 ReaderAnswerHandler（固定单 Agent 流程）
   ├─ 普通聊天：模型回答；失败时使用本地提示
-  └─ 书籍问题：LocalBookToolProvider 做词面检索
+  └─ 书籍问题：LocalBookToolProvider 做 BM25 或配置后的向量混合检索
        ↓
      原文证据校验
        ↓
@@ -62,6 +81,134 @@ SSE 推送状态、回答增量和结束事件
 ```
 
 这不是一个会自主反复决定“调用哪个工具—观察结果—继续调用”的通用 Agent Loop。当前是一个边界清楚的固定阅读问答流程，最多按代码预定路径做原文检索，然后生成回答。
+
+## 核心模块与职责
+
+| 模块 | 当前职责 | 不负责什么 |
+| --- | --- | --- |
+| React 网页 | 阅读、提问、划选、SSE 展示、停止回答、浏览器语音输入和朗读 | 不决定检索范围，不保存模型密钥 |
+| FastAPI API | 登录、CSRF、资源归属、请求合同、幂等与接口响应 | 不让客户端指定内部用户或工具 Scope |
+| `HybridIntentRouter` | 判断路由、追问关系、任务、话题和受限认知状态 | 不直接读取数据库，不执行工具 |
+| `ReaderAnswerHandler` | 固定编排记忆、检索、上下文、模型、发布和写回 | 不是模型自主多步循环 |
+| `LocalBookToolProvider` | 在当前用户/书/版本/章节范围内读取或检索书籍 | 不访问其他用户，不做 Web 搜索 |
+| `ContextAssembler` | 在预算内保留问题、Skill、证据、记忆和最近对话 | 不额外调用模型做摘要 |
+| `BookMemoryStore` | 保存概念、学习事件、学习信号并重建理解状态 | 不保存书籍事实，不跨书生成全局画像 |
+| `AnswerEventLedger` | 管理 SSE 顺序、工具状态、证据状态和唯一终态 | 不自动重跑失败的模型或工具 |
+| `PersistenceBoundary` | 在当前预览模式下统一保存和恢复整体状态 | 默认不代表 PostgreSQL 已完全切换 |
+
+## 一条用户消息的完整生命周期
+
+下面是当前源码中一条消息从网页到保存完成的真实路径。
+
+```text
+用户输入文字，或划选原文后输入问题
+  ↓
+前端 POST /api/v1/books/{book_id}/questions
+  ↓
+Session、CSRF、书籍归属、版本、章节与划选锚点校验
+  ↓
+读取同 conversation_id 的最近完成回合
+  ↓
+HybridIntentRouter：路由 + 任务 + 认知 + 当前话题
+  ↓
+创建 Answer Run，返回 run_id 与 conversation_id
+  ↓
+后台 ReaderAnswerHandler 开始固定流程
+  ├─ 读取最多 4 个最近完成回合
+  ├─ 找上一轮 concept_id，判断是否继续同一概念
+  ├─ 搜索结构化学习记忆；无命中时才查简短讨论记忆
+  ├─ 生成本轮教学动作与动态上下文预算
+  ├─ 明确划选：读取原文 Block
+  └─ 普通书籍问题：搜索书籍 Chunk
+       ├─ 默认 BM25
+       └─ 配置后 BM25 + embedding + RRF
+  ↓
+服务端重新读回 Evidence，验证用户/书/版本/章节/哈希
+  ↓
+ContextAssembler：证据优先，之后是学习记忆和最近历史
+  ↓
+Qwen 兼容模型流式生成
+  ↓
+引用守卫过滤不存在的 [E#]，缺引用时确定性补合法引用
+  ↓
+AnswerEventLedger 进入 completed / failed / cancelled 唯一终态
+  ↓
+成功书籍回答尝试写入结构化学习记忆
+  ├─ 有明确学习信号：Concept → Episode → Signal → State
+  └─ 无结构化信号：写一条简短讨论摘要
+  ↓
+保存 Trace 与 SQLite/PostgreSQL 预览快照
+```
+
+### 1. 前端提交什么
+
+一次问题请求的主要字段是：
+
+```text
+question             用户原始问题
+conversation_id      可选；沿用同一本书的连续对话
+current_chapter_id   可选；用户当前正在看的章节
+selection_context    可选；本轮临时划选的原文、位置和哈希
+highlight_id         可选；已保存高亮
+client_request_id    客户端生成的请求 ID
+Idempotency-Key      HTTP 幂等键
+```
+
+客户端不能提交 `user_id`、`book_version_id`、内部 Scope、最终路由或工具权限。它们全部由服务端从 Session、Book 和当前活动版本推导。
+
+### 2. 请求如何绑定安全范围
+
+API 在进入回答流程前，确认当前 Session 有权访问书籍，并把请求绑定为：
+
+```text
+user_id + book_id + book_version_id + optional chapter_id + request_id + trace_id
+```
+
+划选文字还会校验 Block、偏移量、原文和 SHA-256。对话 ID 如果属于其他用户、其他书或旧版本，对外统一表现为资源不存在，不泄露真实归属。
+
+### 3. 意图与认知如何影响后续步骤
+
+`HybridIntentRouter` 一次产生一个受限的 `IntentFrame`：
+
+- `route` 决定是普通聊天、书籍问答、阅读器操作还是澄清；
+- `relation` 判断是新问题、追问、继续困惑还是纠正；
+- `scope/tasks/context_needs` 决定需要当前段落、当前书、最近对话或外部来源；
+- `cognition` 保存当前话题、学习目标、可能的理解状态和卡点类型；
+- `response_strategy` 把判断压缩为解释、重建、验证、批判、应用或澄清等回答策略。
+
+有模型时由轻量模型返回结构化 JSON；无模型、超时或结果非法时使用确定性降级。模型给出的认知引文必须能在当前或近期用户原话中找到，否则会被丢弃。
+
+### 4. 如何处理“这个、刚才那个、继续”等模糊追问
+
+如果当前消息被判断为追问，运行时会查看上一完成回合 Trace 中的 `concept_id`。当新消息没有明确切换概念时，会沿用上一概念，并把检索查询改写为：
+
+```text
+上一概念规范名 + 当前用户问题
+```
+
+例如“那为什么会这样？”可以改写为“洞穴寓言 那为什么会这样？”。如果当前消息明确提出了一个不同概念，旧概念不会被复用。
+
+### 5. SSE 如何把过程返回前端
+
+创建问题后，前端通过：
+
+```text
+GET /api/v1/answer-runs/{run_id}/events
+```
+
+订阅事件。服务端按递增 `seq` 发送：
+
+```text
+accepted
+status(understanding/searching/generating/saving)
+tool_started
+tool_finished
+evidence
+answer_delta × N
+completed | failed | cancelled
+```
+
+Ledger 禁止工具重复在途、证据之后再调用工具、终态之后继续追加事件，也支持通过 `Last-Event-ID` 回放遗漏事件。当前前端遇到 `EventSource.onerror` 会主动关闭连接，因此服务端回放能力尚未在网页端充分利用。
 
 ## Windows 快速启动
 
@@ -116,7 +263,21 @@ $env:READING_AGENT_INTENT_MODEL = "qwen3.7-flash"
 
 当前适配器名为 `QwenReaderModel`，请求格式使用 DashScope 的 OpenAI 兼容地址。回答模型和向量 embedding 分开配置；embedding 仅在显式开启后调用。
 
-### 3. PostgreSQL＋MinIO 预览模式
+### 3. 可选：启用书籍向量检索
+
+向量检索默认关闭。要让新导入的书籍生成 embedding，需要同时提供 DashScope 密钥并显式开启：
+
+```powershell
+$env:DASHSCOPE_API_KEY = "你的密钥"
+$env:READING_AGENT_ENABLE_EMBEDDINGS = "1"
+.\tools\start_stage05_preview.ps1
+```
+
+开启后，导入会调用 DashScope embedding 接口并校验每条向量为 1024 维有限数值。SQLite 模式把向量随预览状态保存，本地查询使用 cosine；配置 PostgreSQL 时优先尝试 scoped pgvector 查询。任一向量环节失败都会回退到仍然可用的 BM25。
+
+注意：已经在关闭 embedding 时导入的旧书不会自动补齐向量；当前没有独立的批量重建索引命令。
+
+### 4. PostgreSQL＋MinIO 预览模式
 
 只有本机服务已经存在且配置正确时才运行：
 
@@ -158,7 +319,7 @@ Bucket:    reading-agent-stage05
 | 理解反馈 | ✅ | 最新回答提供“我还是卡住、举个例子、我试着复述、继续深入”入口，反馈沿用当前对话和概念 |
 | 持久高亮 | 🟠 | 后端已有创建、列表、删除 API；当前网页没有完整的创建/编辑笔记流程 |
 | 阅读外观设置 | ✅ | 主题、亮度、字号、行高、正文宽度；保存在当前浏览器 localStorage |
-| AI 设置 | ✅ | 长期记忆开关、防剧透、语速、回答风格、深度、自定义表达偏好、书籍类型覆盖 |
+| AI 设置 | 🟠 | 长期记忆、语速、回答风格、深度、自定义表达偏好和书籍类型覆盖已生效；防剧透值可保存但检索边界尚未接入 |
 | 按住说话 | ✅ | 使用浏览器 Web Speech API 把中文语音填进输入框；松手只停止识别，仍需用户发送 |
 | 回答朗读 | ✅ | 使用浏览器 `speechSynthesis`；可调速度 |
 | 定制 AI 声音 | ⬜ | 没有服务端 TTS、音色训练或统一温柔知性音色 |
@@ -235,6 +396,42 @@ PostgreSQL migration 已经包含：
 
 因此当前状态是：**默认 BM25；配置后 DashScope embedding、本地/PG 向量检索与 RRF 已接线，PG runtime 仍部分切换。**
 
+### 一次书籍检索如何产生引用
+
+书籍导入后，运行时保留 `Book → Version → Chapter → Block → Chunk` 的层级。目前预览导入通常让一条 Block 对应一条 Chunk；搜索命中主要 Chunk 后，还会在同一章节内补充前后相邻 Chunk，避免把一个连续论证截成孤立句子。
+
+假设用户先问“洞穴寓言中的影子为什么代表表象？”，下一轮只说“那为什么会这样？”，当前流程是：
+
+```text
+意图识别判断为上一轮追问
+  ↓
+从上一轮 Trace 取出“洞穴寓言”的 concept_id
+  ↓
+查询改写为“洞穴寓言 那为什么会这样？”
+  ↓
+BM25 取字面相关候选
+  +
+可选 embedding 取语义相关候选
+  ↓
+RRF 合并，不直接比较两种分数的绝对值
+  ↓
+保留前 3 个主命中，并补同章节相邻 Chunk
+  ↓
+每个结果生成 EvidenceRef
+```
+
+`EvidenceRef` 记录用户、书、版本、章节、Chunk、Block、原文、哈希和来源位置。回答前，`issue_verified_evidence_token` 会通过服务端 Evidence Reader 重新读回这些记录；只有范围和内容校验通过后，Ledger 才允许发送 `evidence`、`answer_delta` 和 `completed`。
+
+回答模型看到的是 `[E1]`、`[E2]` 等本轮局部编号。流式发布时 `_CitationStreamGuard` 会缓冲可能被拆开的引用标记并删除超出本轮 Evidence 数量的编号；结束时 `prepare_answer_for_publish` 再做一次确定性检查。这个校验确认“引用编号确实存在”，但不等同于完整的事实一致性或论证正确性评测。
+
+### 当前检索质量边界
+
+- 一次普通书籍问题主要围绕一个查询取 Top 3，不会自动拆成多路子问题；
+- 没有独立 cross-encoder/reranker 判断“语义相似的段落是否真的能回答问题”；
+- 跨章节长论证主要依赖全书检索结果，不会自动构建多跳论证链；
+- 当前相邻扩展只在同一章节内进行，不跨章节拼接；
+- Web 搜索没有启用，因此 `[E#]` 当前只代表本地书籍证据。
+
 ### 工具系统的真实状态
 
 合同层定义了搜索书籍、读取原文 Block、读取目录、搜索阅读记忆、Web 搜索和读取网页来源等工具。
@@ -251,6 +448,93 @@ PostgreSQL migration 已经包含：
 ## 记忆系统的真实状态
 
 当前存在三层可运行数据，以及一套更深但尚未闭环的结构。
+
+### 记忆不是书籍知识库
+
+当前运行时严格区分两条检索线路：
+
+```text
+书籍知识检索：回答“书里到底写了什么”，产出可引用 Evidence
+用户记忆检索：回答“这个用户之前哪里没懂、这次应该怎样讲”，只作为背景
+```
+
+结构化学习记忆目前不使用向量数据库。已知当前概念时，按 `user_id + book_id + book_version_id + concept_id` 精确读取，比相似度搜索更稳定；概念尚未锁定时，才用当前问题与概念名、学习事件摘要的中英文词项重叠进行排序。跨书、跨概念语义记忆增多以后才有引入向量召回的必要。
+
+### 回答前：记忆如何被搜索
+
+```text
+当前问题 + IntentFrame
+  ↓
+判断是否沿用上一轮 concept_id
+  ↓
+MemoryPlanner 生成有界计划
+  ├─ 非书籍路由：不读书籍学习记忆
+  ├─ 已知概念：先查 ConceptState，再查 LearningEpisode
+  └─ 未知概念：先按问题查 Episode，再看相关 State
+  ↓
+MemoryRetriever 先做用户/书/版本隔离，再排序
+  ↓
+最多 1 条概念状态 + 3 条学习事件，总预算 900 token
+  ↓
+有结构化命中：不再加载旧讨论摘要
+无结构化命中：ReadingMemoryStore 最多返回 3 条关键词相关摘要
+```
+
+概念精确命中拥有最高权重；之后考虑问题文字重叠、`blocked/partial/verified/conflicted` 等状态和时间。`unknown` 状态不会作为有用记忆返回。结果会被压缩成短 `MemoryHit`，例如：
+
+```text
+概念「机会成本」的 relation 理解状态：blocked
+用户曾问：为什么不是计算所有放弃的东西？（策略：example）
+```
+
+进入模型前，记忆会被显式包装为“书籍学习记忆；仅作背景，不是原文证据”。最终 `ContextAssembler` 仍然优先保留书籍 Evidence；预算不足时可以裁掉记忆或旧历史，但尽量不丢用户本轮明确选择的原文。
+
+### 回答后：什么会写入记忆
+
+只有同时满足以下条件，`BookMemoryWriter` 才尝试写结构化学习记忆：
+
+```text
+书籍问答 + 回答成功完成 + 长期记忆开启 + 存在明确学习信号
+```
+
+当前可写信号包括明确困惑、用户纠正、明确自述理解，以及受限认知判断识别出的复述、重建或应用表现。普通总结、无明确学习表现的闲聊、失败和取消回答不会写入结构化学习事件。
+
+写入顺序是：
+
+```text
+resolve_concept
+  ↓ 复用同名/别名概念，或为明确新话题建立临时概念
+LearningEpisode
+  ↓ 记录问题、学习目标、卡点、回答策略和 Evidence ID
+LearningSignal
+  ↓ 记录正/负方向、强度、来源和 candidate/accepted 状态
+ConceptState
+  ↓ 从已接受信号重建 meaning/argument/application/critique/relation 状态
+```
+
+首次明确困惑通常先保持为 `CANDIDATE`；下一次同概念反馈会确认前一困惑，再应用新信号。单纯说“我懂了”最多支持保守的 `partial`，不会直接升级为 `verified`。`verified` 应依赖可观察的正确复述、重建或应用，但当前还没有独立的原文对照复述评测器。
+
+Answer 会先进入完成终态，再尝试记忆写回。记忆写回异常只在 Trace 中记录 `writeback_failed`，不会让用户已经得到的回答变成失败。如果本轮没有结构化信号，系统才保存一条简短讨论摘要，避免两套记忆重复写入。
+
+### 三轮对话示例
+
+```text
+第 1 轮：用户说“我不懂机会成本为什么只算最佳替代选项”
+  → 没有旧概念记忆
+  → 检索书籍 Evidence 并解释
+  → 创建“机会成本”概念、学习事件和候选困惑信号
+
+第 2 轮：用户说“还是没懂，其他放弃的东西难道不是成本吗”
+  → 沿用上一轮 concept_id
+  → 召回上一困惑，检索查询补上“机会成本”
+  → 教学策略要求换解释路径，不重复定义
+  → 确认上一困惑，更新 relation 维度为 blocked
+
+第 3 轮：用户说“我理解是不是：读书时放弃的最佳工作机会才是机会成本”
+  → 召回 relation=blocked 和前两次 Episode
+  → 以相关原文回答并检查这次复述
+  → 写正向信号，保守更新为 partial；独立校验完成后才适合 verified
+```
 
 ### 1. 对话历史：✅ 已接入
 
@@ -373,6 +657,27 @@ PostgreSQL migration 已经包含：
 | 多端实时同步 | ⬜ | 没有 WebSocket/推送、跨端会话状态同步或内容合并策略 |
 | 多端偏好同步 | ⬜ | 阅读外观保存在浏览器 localStorage，仅当前浏览器可见 |
 
+## 回答失败、取消、重连与恢复
+
+回答运行时采用“能安全降级就继续，缺少书籍证据就失败”的原则。当前没有对回答模型或书籍工具做自动重复调用。
+
+| 故障位置 | 当前行为 | 是否自动重试 |
+| --- | --- | --- |
+| 意图模型无密钥、超时或非法 JSON | 使用关键词和规则生成降级 Intent，问题继续处理 | 否，直接降级 |
+| embedding/pgvector 失败 | 尝试本地向量；仍失败时继续 BM25 | 否，逐级降级 |
+| 书籍搜索没有 Evidence | 工具标记失败，Answer 进入 `failed`，不让模型无证据编造 | 否 |
+| 回答模型在输出前失败 | 书籍问题返回“模型不可用＋最相关原文”的本地答案；普通聊天返回本地提示 | 否，直接降级 |
+| 回答模型输出部分内容后失败 | 不拼接另一套兜底答案，Answer 进入 `failed` | 否 |
+| 记忆写回失败 | Answer 保持 `completed`，Trace 记录失败 | 否，不影响回答 |
+| 用户点击停止 | 设置取消标志并关闭活动模型响应，Ledger 进入 `cancelled` | 不适用 |
+| SSE 连接中断 | 服务端 Ledger 可按 `Last-Event-ID` 回放；当前网页会关闭出错连接 | 前端尚未充分自动恢复 |
+| 进程在回答中硬退出 | 重启后恢复最近合法快照；在途生成不会自动续跑 | 否，用户需重新提问 |
+| 重复提交相同幂等键和请求体 | 返回原 Answer Run，避免创建重复任务 | 这是去重，不是重算 |
+
+`AnswerEventLedger` 只允许一个终态：`completed`、`failed` 或 `cancelled`。工具在途时不能用相同 `call_id` 重试，终态以后也不能继续发送 Answer Delta。PostgreSQL Answer Store 配置存在时，事件先写入持久化 Sink，再进入进程内回放列表；默认 SQLite 模式则在请求和回答结束时保存整体快照。
+
+导入和删除使用另一套 Job 状态机，已经定义 queued/running/lease/checkpoint/retry/cancel，但启动脚本当前没有常驻 Worker 自动消费重试后的任务。因此 Answer 重试和 Job 重试不要视为同一个能力。
+
 ## 认证与安全边界
 
 已经实现：
@@ -406,6 +711,70 @@ PostgreSQL migration 已经包含：
 - 云 OSS 的正式生产配置与运维；
 - 正式账号体系、付费、部署和运营后台。
 
+## 常用环境变量
+
+| 变量 | 默认值/行为 | 用途 |
+| --- | --- | --- |
+| `DASHSCOPE_API_KEY` | 空；模型能力降级 | 意图、回答、书籍分类和可选 embedding 的凭证 |
+| `READING_AGENT_MODEL` | `qwen3.7-plus` | 回答模型名 |
+| `READING_AGENT_INTENT_MODEL` | `qwen3.7-flash` | 结构化意图与认知模型名 |
+| `READING_AGENT_INTENT_TIMEOUT_SECONDS` | `5` | 意图调用超时，运行时限制在安全范围内 |
+| `READING_AGENT_ENABLE_EMBEDDINGS` | `0` | 设为 `1` 才启用导入 embedding 和混合检索 |
+| `READING_AGENT_PREVIEW_EMAIL` | `reader@example.local` | 本地预览账号 |
+| `READING_AGENT_PREVIEW_PASSWORD` | `reading-demo` | 本地预览密码 |
+| `READING_AGENT_PREVIEW_DATA_ROOT` | 项目根目录 | SQLite 快照和本地上传文件根目录 |
+| `READING_AGENT_STAGE05_POSTGRES_DSN` | 空 | PostgreSQL 预览连接；兼容 `READING_AGENT_STAGE05_DSN` |
+| `READING_AGENT_STAGE05_MINIO_ENDPOINT` | 空 | 配置后启用 MinIO 原文件镜像 |
+| `READING_AGENT_STAGE05_MINIO_ACCESS_KEY` | 空 | MinIO Access Key |
+| `READING_AGENT_STAGE05_MINIO_SECRET_KEY` | 空 | MinIO Secret Key |
+| `READING_AGENT_STAGE05_MINIO_BUCKET` | `reading-agent-stage05` | 私有 Bucket 名称 |
+| `READING_AGENT_STAGE05_MINIO_SECURE` | `0` | `1` 表示使用 HTTPS 连接 MinIO |
+
+## 主要 HTTP 接口
+
+| 方法与路径 | 用途 |
+| --- | --- |
+| `POST /api/v1/sessions` | 登录并建立 Cookie Session |
+| `GET /api/v1/session` | 查询当前 Session |
+| `GET/POST /api/v1/books` | 书架列表与上传导入 |
+| `GET /api/v1/books/{book_id}/chapters` | 分页读取目录 |
+| `GET /api/v1/books/{book_id}/chapters/{chapter_id}/blocks` | 分页读取章节正文 |
+| `GET/PUT /api/v1/books/{book_id}/progress` | 读取或乐观锁更新进度 |
+| `GET/POST/DELETE /api/v1/books/{book_id}/highlights...` | 高亮合同；网页创建流程尚未完整接入 |
+| `POST /api/v1/books/{book_id}/questions` | 创建 Answer Run 并返回 Intent |
+| `GET /api/v1/answer-runs/{run_id}/events` | SSE 状态、工具、证据和回答流 |
+| `POST /api/v1/answer-runs/{run_id}/cancel` | 取消运行中的回答 |
+| `GET /api/v1/answer-runs/{run_id}/evidence` | 读取已验证 Evidence Bundle |
+| `GET /api/v1/books/{book_id}/answers` | 读取当前书籍回答历史 |
+| `GET /api/v1/books/{book_id}/book-memory` | 动态生成结构化学习画像视图 |
+| `DELETE /api/v1/books/{book_id}/memories` | 清除该书简短记忆和结构化学习记忆 |
+| `GET /api/v1/traces/{trace_id}` | 查看安全白名单内的运行 Trace |
+
+除登录等建立会话的入口外，已认证的非只读请求都需要 CSRF；上传、问题、高亮、Job 重试等可重复操作使用幂等键或明确状态约束。OpenAPI 来自同一套 Pydantic 合同，但前端 `types.ts` 目前仍为手工维护，并非自动生成。
+
+## 开发与验证
+
+后端测试按能力分在 `tests/contracts`、`tests/stage05` 和 `tests/stage06`。大部分测试使用内存对象或临时 SQLite；真实 PostgreSQL、MinIO、浏览器 E2E 和付费 DashScope 调用需要单独环境，不应混进每次小改动的默认验证。
+
+常用的低成本检查：
+
+```powershell
+# 与当前改动直接相关的 Python 测试
+.\.venv\Scripts\python.exe -m pytest tests\stage05\test_agent_core_v1.py -q
+
+# 记忆闭环
+.\.venv\Scripts\python.exe -m pytest tests\stage05\test_book_memory_v1.py tests\stage05\test_memory_plan_v1.py tests\stage05\test_memory_writeback_v1.py -q
+
+# 检索
+.\.venv\Scripts\python.exe -m pytest tests\stage05\test_retrieval_v1.py tests\stage05\test_retrieval_v2.py -q
+
+# 前端类型检查与生产构建
+Set-Location web
+pnpm run build
+```
+
+`test_live_dashscope_embedding` 属于真实付费/外部调用路径，默认测试不会自动执行。PostgreSQL 适配器测试需要可连接并安装 pgvector 的真实数据库。
+
 ## 代码地图
 
 | 位置 | 作用 |
@@ -418,7 +787,7 @@ PostgreSQL migration 已经包含：
 | `src/reading_agent/memory.py` | 简短的书籍讨论记忆 |
 | `src/reading_agent/book_memory.py` | 概念、学习事件、信号、理解状态与书籍学习视图 |
 | `src/reading_agent/memory_plan.py` | 从意图生成记忆召回计划并做有界检索 |
-| `src/reading_agent/memory_writeback.py` | 完成回答后的困惑事件与候选信号写回 |
+| `src/reading_agent/memory_writeback.py` | 完成回答后的困惑、理解、复述和纠正信号写回 |
 | `src/reading_agent/companion.py` | 书籍自动分类、内置阅读 Skill、用户偏好 |
 | `skills/reading/book_skills.v1.json` | 各书籍类型的内置阅读方法 |
 | `src/reading_agent/contracts.py` | API、Intent、Tool、SSE、Book/Job/Answer 等严格数据合同 |
@@ -434,13 +803,12 @@ PostgreSQL migration 已经包含：
 
 ## 后续开发的合理接线顺序
 
-如果目标是尽快让产品“更懂书、更懂用户”，应先补主链路，不应继续只增加接口：
+当前检索、上下文和单书学习记忆已经进入主链路。下一阶段应继续围绕“理解用户”和“陪伴阅读”，而不是先扩建通用平台能力：
 
-1. **继续完善真实检索**：补充 embedding/PG runtime 的生产治理，同时保留无 embedding 时的 BM25 降级。
-2. **再闭合书籍学习记忆**：生成稳定概念锚点，把后续确认/纠正关联到旧 Episode，验证 Signal 后更新 ConceptState，让 Profile 真正有数据可用。
-3. **再完成 PostgreSQL 读取切换**：逐步让 Book、Chapter、Block、Answer History 和证据读取以规范化仓储为来源，移除整体快照的主运行时职责。
-4. **再拆独立 Worker**：上传请求只创建 Job；Worker 负责解析、分块、embedding、校验和发布，并能从 checkpoint 恢复。
-5. **最后扩展工具与语音**：在固定阅读链路稳定后，再接联网/MCP 和低延迟语音，避免把多个未闭环模块同时堆进运行时。
+1. **补理解校验**：用户主动复述、回答测试题或应用概念时，用相关原文做一次受限判断，只返回正确、部分正确、存在误解或无法判断，并据此决定是否把 ConceptState 升级为 `verified`。
+2. **重构前端交互骨架**：把当前集中在 `App.tsx` 的阅读、回答流、设置和语音拆成少量组件与 Hook；先让 Answer/SSE 生命周期清楚，再重做视觉和陪伴交互。
+3. **让语音复用同一 Reading Agent Loop**：语音只负责听、说、打断和低延迟体验，最终文本仍进入同一意图、记忆、检索、证据和写回链路，避免出现第二套没有书籍依据的“语音大脑”。
+4. **按真实发布需求再补基础设施**：多实例或大规模导入出现之前，不优先做完整 PostgreSQL Cutover、独立 Worker、通用 MCP 网关和跨书画像；需要时再逐项接入。
 
 ## 给后续开发者或 AI 的核对规则
 
